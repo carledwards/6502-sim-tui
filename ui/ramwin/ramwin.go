@@ -163,8 +163,12 @@ func (p *Provider) drawHex(c *foxpro.Canvas, theme foxpro.Theme, bg, pcStyle, ed
 	//   Yellow  → write that changed the byte (most interesting)
 	//   Brown   → write that left the byte unchanged (touched but no-op)
 	//   Green   → read
+	//
+	// Yellow is bright (CGA #FFFF55) — the inherited white fg from
+	// `bg` is unreadable on top of it, so we force black fg there.
+	// Brown and Green are dark enough that white fg keeps contrast.
 	readStyle := bg.Background(theme.Palette.Green)
-	writeChStyle := bg.Background(theme.Palette.Yellow)
+	writeChStyle := bg.Background(theme.Palette.Yellow).Foreground(theme.Palette.Black)
 	writeNcStyle := bg.Background(theme.Palette.Brown)
 	const traceFreshness = 20 // ~1 second at 20 fps
 

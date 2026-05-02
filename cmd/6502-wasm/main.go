@@ -38,15 +38,21 @@ import (
 	"github.com/carledwards/6502-sim-tui/ui/ramwin"
 )
 
-// Memory map. Mirrors cmd/6502-sim — no host-specific changes.
+// Memory map. Extends cmd/6502-sim's layout with a graphics plane —
+// 160×104 at 4bpp = 8,320 bytes — placed at $A000. Below RAM and
+// above the VIC controller, well clear of ROM at $E000.
 const (
 	ramBase   = 0x0000
 	ramSize   = 0x2000 // 8 KB at $0000-$1FFF
 	colorBase = 0x8200 // VIC color plane (520 bytes)
 	charBase  = 0x8500 // VIC char plane  (520 bytes)
-	ctrlBase  = 0x8800 // VIC controller registers (3 bytes)
+	ctrlBase  = 0x8800 // VIC controller registers (8 bytes; +7 = GfxColor)
 	dispW     = 40
 	dispH     = 13
+	gfxBase   = 0xA000
+	gfxW      = 160
+	gfxH      = 104
+	gfxBPP    = 4
 	romBase   = 0xE000
 	romSize   = 0x2000
 )
@@ -95,14 +101,28 @@ func main() {
 	}
 	paintInitialDisplay()
 
-	dispCtrl := display.NewController("display.ctrl", ctrlBase, colorPlane, charPlane)
+	gfxPlane := display.NewGraphicsPlane(display.GraphicsConfig{
+		Name:   "display.gfx",
+		Base:   gfxBase,
+		Width:  gfxW,
+		Height: gfxH,
+		BPP:    gfxBPP,
+	})
+	dispCtrl := display.NewControllerWithGraphics("display.ctrl", ctrlBase, colorPlane, charPlane, gfxPlane)
 
-	must(mainROM.Load(0, demos.Marquee))
+	// Boot directly into BouncingBalls — graphics is always wired in
+	// the wasm build (gfxPlane registered above), so this is the
+	// most visually interesting first impression. Other demos
+	// (Marquee, Bouncer, etc.) are still selectable via the Demo
+	// menu. The terminal build (cmd/6502-sim) keeps Marquee as its
+	// default since it doesn't currently include a graphics plane.
+	must(mainROM.Load(0, demos.BouncingBalls))
 	must(mainROM.SetResetVector(0xE000))
 	must(b.Register(mainRAM))
 	must(b.Register(colorPlane))
 	must(b.Register(charPlane))
 	must(b.Register(dispCtrl))
+	must(b.Register(gfxPlane))
 	must(b.Register(mainROM))
 
 	buildBackend := func(name string) (cpu.Backend, error) {
@@ -203,6 +223,8 @@ func main() {
 	machineReset := func() {
 		clockProv.SetRunning(false)
 		b.Write(ctrlBase+display.RegPause, 0)
+		b.Write(ctrlBase+display.RegMode, display.ModeChar)
+		gfxPlane.Clear(0)
 		mainRAM.Reset()
 		paintInitialDisplay()
 		clockProv.Reset()
@@ -219,14 +241,17 @@ func main() {
 		HasCtrl:       true,
 		Width:         dispW,
 		Height:        dispH,
+		Graphics:      gfxPlane,
 		MemRangeStart: colorBase,
-		MemRangeEnd:   ctrlBase + 6,
+		MemRangeEnd:   ctrlBase + 8, // controller now 9 bytes (0..8)
 	}
-	dispTitle := fmt.Sprintf("VIC $%04X-$%04X", colorBase, ctrlBase+6)
-	addWindow(dispTitle,
+	dispTitle := fmt.Sprintf("VIC $%04X-$%04X", colorBase, ctrlBase+8)
+	dispWindow := addWindow(dispTitle,
 		foxpro.Rect{X: 60, Y: 1, W: 77, H: 29},
 		dispProv,
 		displaywin.MinW, displaywin.MinH)
+	dispProv.Window = dispWindow // lets Provider append [TEXT]/[GFX] to the title each Draw
+
 
 	// Run loop. App.Tick fires on the UI goroutine, so simulator
 	// advancement, register reads, and bus reads all serialize
@@ -270,6 +295,8 @@ func main() {
 	loadDemo := func(d demos.Demo) {
 		clockProv.SetRunning(false)
 		b.Write(ctrlBase+display.RegPause, 0)
+		b.Write(ctrlBase+display.RegMode, display.ModeChar)
+		gfxPlane.Clear(0)
 		mainROM.Clear()
 		_ = mainROM.Load(0, d.Bytes)
 		_ = mainROM.SetResetVector(0xE000)
@@ -382,6 +409,24 @@ func main() {
 		}},
 	}
 
+	// Auto-tune the batch size for this browser / device before
+	// kicking the clock off. The same logic the CPU menu's
+	// "Auto-tune Batch" item runs — happens once at boot so first-
+	// frame motion lands on a sensible batch instead of the default
+	// 500. autoTune advances cycles, so reset everything afterwards
+	// to start the demo from a clean slate.
+	clockProv.MaxBatch = autoTune(backend, 35*time.Millisecond)
+	backend.Reset()
+	mainRAM.Reset()
+	paintInitialDisplay()
+	clockProv.Reset()
+
+	// Default to max speed — no Hz cap, run as many HalfSteps per
+	// UI tick as the auto-tuned batch allows. Visitors land on a
+	// page that's already at full motion; they can throttle via
+	// the Clock window or '<' / '>' keys if they want a slower view.
+	clockProv.SetSpeedHz(0)
+
 	clockProv.SetRunning(true) // browser visitors expect motion right away
 	wasm.Run(app, s)
 }
@@ -391,3 +436,4 @@ func must(err error) {
 		panic(err)
 	}
 }
+

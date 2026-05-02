@@ -72,6 +72,24 @@
     statusEl.textContent = `${w}×${h} cells · click to focus · F10 menu · R run · . stop · S step · Z reset`;
   }
 
+  // Sentinel rune stamped into framebuffer cells when the VIC is in
+  // graphics mode. Cells with this codepoint get pixel content
+  // substituted in their place — but only there. Cells overwritten
+  // by other windows or drop shadows lose the sentinel and render
+  // normally, which is how foxpro window z-order is honored without
+  // the bridge having to know about stacking.
+  //
+  // Must match displaywin.pixelPlaceholderRune on the Go side.
+  const PIXEL_SENTINEL = 0xE000;
+
+  // Off-screen canvases per pixel layer. Each frame we putImageData
+  // the layer's RGBA bytes into its own canvas, then for every
+  // sentinel cell we drawImage the matching pixel sub-region into
+  // the main canvas. Per-cell drawImage means we ONLY draw where
+  // foxpro left a sentinel — overlapping windows naturally win.
+  const pixelLayerCanvases = new Map();
+  let pixelBuf = null;
+
   function frame() {
     if (stopped) return;
     requestAnimationFrame(frame);
@@ -88,6 +106,10 @@
       return;
     }
     const w = sz[0], h = sz[1];
+
+    // Cell pass — paint everything except sentinel cells. Sentinels
+    // are left as their bg (fillRect runs) so the substitution step
+    // can drawImage on a known canvas state.
     for (let y = 0; y < h; y++) {
       let off = y * w * 16;
       for (let x = 0; x < w; x++) {
@@ -98,6 +120,67 @@
         paintCell(x, y, ch, fg, bg);
       }
     }
+
+    // Pixel-layer substitution pass.
+    substitutePixelLayers(fw, w, h);
+  }
+
+  function substitutePixelLayers(fw, w, h) {
+    const layers = fw.pixelLayers();
+    if (!layers || layers.length === 0) {
+      // Drop any cached canvases for layers that disappeared.
+      pixelLayerCanvases.clear();
+      return;
+    }
+    const seen = new Set();
+    for (const L of layers) {
+      seen.add(L.id);
+      let entry = pixelLayerCanvases.get(L.id);
+      if (!entry) {
+        const c = document.createElement('canvas');
+        entry = { canvas: c, ctx: c.getContext('2d'), pxW: 0, pxH: 0 };
+        pixelLayerCanvases.set(L.id, entry);
+      }
+      if (entry.pxW !== L.pxW || entry.pxH !== L.pxH) {
+        entry.canvas.width = L.pxW;
+        entry.canvas.height = L.pxH;
+        entry.pxW = L.pxW;
+        entry.pxH = L.pxH;
+      }
+      const need = L.pxW * L.pxH * 4;
+      if (!pixelBuf || pixelBuf.length < need) {
+        pixelBuf = new Uint8Array(Math.max(need, 256 * 1024));
+      }
+      if (!fw.pixelLayerData(L.id, pixelBuf)) continue;
+      const clamped = new Uint8ClampedArray(pixelBuf.buffer, pixelBuf.byteOffset, need);
+      entry.ctx.putImageData(new ImageData(clamped, L.pxW, L.pxH), 0, 0);
+
+      // Per-cell substitution — only draw at sentinel cells. Maps
+      // the body rect (cellW × cellH cells) onto the layer's pixel
+      // buffer (pxW × pxH) so each cell shows its matching slice.
+      const subW = L.pxW / L.cellW;
+      const subH = L.pxH / L.cellH;
+      for (let cy = 0; cy < L.cellH; cy++) {
+        const screenY = L.cellY + cy;
+        if (screenY < 0 || screenY >= h) continue;
+        for (let cx = 0; cx < L.cellW; cx++) {
+          const screenX = L.cellX + cx;
+          if (screenX < 0 || screenX >= w) continue;
+          const off = (screenY * w + screenX) * 16;
+          const ch = view.getUint32(off, true);
+          if (ch !== PIXEL_SENTINEL) continue;
+          ctx.drawImage(
+            entry.canvas,
+            cx * subW, cy * subH, subW, subH,
+            screenX * cellW, screenY * CELL_H, cellW, CELL_H,
+          );
+        }
+      }
+    }
+    // Trim cached canvases for vanished layers.
+    for (const id of pixelLayerCanvases.keys()) {
+      if (!seen.has(id)) pixelLayerCanvases.delete(id);
+    }
   }
 
   function paintCell(x, y, ch, fg, bg) {
@@ -105,7 +188,9 @@
     const py = y * CELL_H;
     ctx.fillStyle = colorToCSS(bg, DEFAULT_BG);
     ctx.fillRect(px, py, cellW, CELL_H);
-    if (ch === 0 || ch === 32) return;
+    // No glyph for blanks or pixel-layer sentinels — sentinels get
+    // pixel data drawn in over them by substitutePixelLayers.
+    if (ch === 0 || ch === 32 || ch === PIXEL_SENTINEL) return;
     const fgCss = colorToCSS(fg, DEFAULT_FG);
     if (ch >= 0x2500 && ch <= 0x258F) {
       if (drawBoxOrBlock(px, py, ch, fgCss)) return;

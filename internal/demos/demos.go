@@ -43,6 +43,9 @@ func Sections() []Section {
 			{"&Blitter (RAM→VIC)", Blitter},
 			{"&Quadrants (4 scrolls)", Quad},
 		}},
+		{[]Demo{
+			{"&Bouncing Balls (graphics mode)", BouncingBalls},
+		}},
 	}
 }
 
