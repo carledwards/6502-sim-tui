@@ -124,8 +124,11 @@ func (p *Provider) PixelSize() (int, int) {
 	return p.Graphics.Width(), p.Graphics.Height()
 }
 
-// DrawPixels fills buf with RGBA bytes (4 per pixel, row-major) by
-// reading the graphics plane through classicCGAPalette.
+// DrawPixels fills buf with RGBA bytes (4 per pixel, row-major).
+// Reads through Controller.ReadGfxPixel so pause/frame state is
+// honored — when the CPU has paused the VIC and committed a frame,
+// the user sees the captured snapshot, not in-progress pixels. Same
+// double-buffer story as the existing color/char planes.
 func (p *Provider) DrawPixels(buf []byte) {
 	if !p.graphicsActive() {
 		return
@@ -135,7 +138,7 @@ func (p *Provider) DrawPixels(buf []byte) {
 	ph := g.Height()
 	for y := 0; y < ph; y++ {
 		for x := 0; x < pw; x++ {
-			rgb := classicCGAPalette[g.GetPixel(x, y)&0x0F]
+			rgb := classicCGAPalette[p.Controller.ReadGfxPixel(x, y)&0x0F]
 			i := (y*pw + x) * 4
 			buf[i+0] = rgb[0]
 			buf[i+1] = rgb[1]

@@ -2,13 +2,9 @@ module github.com/carledwards/6502-sim-tui
 
 go 1.26.2
 
-replace github.com/carledwards/foxpro-go => ../foxpro-go
-
-replace github.com/carledwards/6502-netsim-go => ../6502-netsim-go
-
 require (
-	github.com/carledwards/6502-netsim-go v0.0.0-00010101000000-000000000000
-	github.com/carledwards/foxpro-go v0.0.0-00010101000000-000000000000
+	github.com/carledwards/6502-netsim-go v0.1.0
+	github.com/carledwards/foxpro-go v0.1.2
 	github.com/gdamore/tcell/v2 v2.7.4
 )
 

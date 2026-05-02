@@ -3,7 +3,11 @@
 // through a 16-color palette.
 package display
 
-import "time"
+import (
+	"time"
+
+	"github.com/carledwards/6502-sim-tui/asm"
+)
 
 // Display is a width × height byte grid mapped onto a contiguous
 // region of the bus. Reads / Writes through the bus interface
@@ -149,6 +153,7 @@ type Controller struct {
 	paused    bool
 	snapColor []uint8
 	snapChar  []uint8
+	snapGfx   []uint8 // graphics-plane snapshot, populated only when Graphics != nil
 
 	// Rect parameters consumed by CmdRect* commands. Updated on
 	// writes to RegRectX/Y/W/H; persist across commands so a CPU
@@ -180,6 +185,24 @@ func NewControllerWithGraphics(name string, base uint16, color, chars *Display, 
 func (c *Controller) Name() string { return c.name }
 func (c *Controller) Base() uint16 { return c.base }
 func (c *Controller) Size() int    { return 9 }
+
+// Symbols implements bus.Labeller — returns the controller's
+// register layout so memory views can show labels for the VIC
+// register block.
+func (c *Controller) Symbols() []asm.Symbol {
+	b := c.base
+	return []asm.Symbol{
+		{Name: "VIC_CMD", Addr: b + RegCmd, Size: 1, Note: "command register (write to fire op)"},
+		{Name: "VIC_PAUSE", Addr: b + RegPause, Size: 1, Note: "0=live, 1=show snapshot"},
+		{Name: "VIC_FRAME", Addr: b + RegFrame, Size: 1, Note: "any write captures snapshot"},
+		{Name: "VIC_RECT_X", Addr: b + RegRectX, Size: 1, Note: "rect/draw X"},
+		{Name: "VIC_RECT_Y", Addr: b + RegRectY, Size: 1, Note: "rect/draw Y"},
+		{Name: "VIC_RECT_W", Addr: b + RegRectW, Size: 1, Note: "rect/draw width or radius"},
+		{Name: "VIC_RECT_H", Addr: b + RegRectH, Size: 1, Note: "rect/draw height"},
+		{Name: "VIC_GFX_COLOR", Addr: b + RegGfxColor, Size: 1, Note: "current draw color (palette idx)"},
+		{Name: "VIC_MODE", Addr: b + RegMode, Size: 1, Note: "0=char, 1=graphics"},
+	}
+}
 
 // Mode returns the current display mode (ModeChar or ModeGraphics).
 // Renderers use this to decide whether to draw the character grid or
@@ -390,6 +413,13 @@ func (c *Controller) captureSnapshot() {
 	}
 	copy(c.snapColor, cb)
 	copy(c.snapChar, chb)
+	if c.Graphics != nil {
+		gb := c.Graphics.Bytes()
+		if len(c.snapGfx) != len(gb) {
+			c.snapGfx = make([]uint8, len(gb))
+		}
+		copy(c.snapGfx, gb)
+	}
 }
 
 // IsPaused reports whether display reads return snapshot bytes.
@@ -414,6 +444,32 @@ func (c *Controller) ReadColor(off int) uint8 {
 		return c.snapColor[off]
 	}
 	return c.color.Bytes()[off]
+}
+
+// ReadGfxPixel returns the palette index of the graphics-plane pixel
+// at (x, y), honoring pause state — when paused, the snapshot bytes
+// are decoded; otherwise the live plane is sampled. Returns 0 if no
+// graphics plane is attached or coords are out of bounds.
+func (c *Controller) ReadGfxPixel(x, y int) uint8 {
+	if c.Graphics == nil {
+		return 0
+	}
+	g := c.Graphics
+	if x < 0 || y < 0 || x >= g.Width() || y >= g.Height() {
+		return 0
+	}
+	if !c.paused || len(c.snapGfx) == 0 {
+		return g.GetPixel(x, y)
+	}
+	bitOffset := x * g.BPP()
+	off := y*g.Stride() + bitOffset/8
+	if off >= len(c.snapGfx) {
+		return 0
+	}
+	bitWithin := bitOffset % 8
+	shift := 8 - g.BPP() - bitWithin
+	mask := byte((1 << g.BPP()) - 1)
+	return (c.snapGfx[off] >> shift) & mask
 }
 
 // ReadChar returns the char byte at the linear offset, honoring

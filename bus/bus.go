@@ -9,6 +9,9 @@ package bus
 import (
 	"fmt"
 	"sort"
+	"time"
+
+	"github.com/carledwards/6502-sim-tui/asm"
 )
 
 // Bus is a 16-bit-address memory map.
@@ -34,6 +37,33 @@ type Component interface {
 	Size() int
 	Read(offset uint16) uint8
 	Write(offset uint16, val uint8)
+}
+
+// Ticker is an optional interface a component can implement to take
+// part in wall-clock advancement. The bus calls Tick on every
+// registered Ticker once per host frame, passing the elapsed duration
+// since the previous Tick. Components use this to model peripherals
+// driven by their own oscillator (e.g. a 6522 VIA timer) — they keep
+// running while the CPU is halted, single-stepping, or breakpointed,
+// because their crystal is not the CPU clock.
+//
+// dt is wall-clock time; the component is responsible for converting
+// it to its own internal counter rate.
+type Ticker interface {
+	Tick(dt time.Duration)
+}
+
+// Labeller is an optional interface a component can implement to
+// expose its register layout as named symbols. The memory window's
+// Labels view merges component-provided symbols with program-provided
+// ones, so a memory dump of the VIA's region shows readable names
+// (T1C-L, IFR, ACR, …) instead of raw offsets.
+//
+// Components return absolute-address symbols (their own Base + offset),
+// so callers can treat all symbols uniformly without knowing where
+// the component lives on the bus.
+type Labeller interface {
+	Symbols() []asm.Symbol
 }
 
 // New returns an empty bus.

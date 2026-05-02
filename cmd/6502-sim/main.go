@@ -11,10 +11,12 @@ import (
 
 	foxpro "github.com/carledwards/foxpro-go"
 
+	"github.com/carledwards/6502-sim-tui/asm"
 	"github.com/carledwards/6502-sim-tui/bus"
 	"github.com/carledwards/6502-sim-tui/components/display"
 	"github.com/carledwards/6502-sim-tui/components/ram"
 	"github.com/carledwards/6502-sim-tui/components/rom"
+	"github.com/carledwards/6502-sim-tui/components/via"
 	"github.com/carledwards/6502-sim-tui/cpu"
 	"github.com/carledwards/6502-sim-tui/cpu/interp"
 	"github.com/carledwards/6502-sim-tui/cpu/netsim"
@@ -23,6 +25,7 @@ import (
 	"github.com/carledwards/6502-sim-tui/ui/cpuwin"
 	"github.com/carledwards/6502-sim-tui/ui/displaywin"
 	"github.com/carledwards/6502-sim-tui/ui/ramwin"
+	"github.com/carledwards/6502-sim-tui/ui/viawin"
 
 	"github.com/gdamore/tcell/v2"
 )
@@ -40,9 +43,10 @@ import (
 const (
 	ramBase   = 0x0000
 	ramSize   = 0x2000 // 8 KB at $0000-$1FFF
-	colorBase = 0x8200 // VIC color plane (520 bytes)
-	charBase  = 0x8500 // VIC char plane  (520 bytes)
-	ctrlBase  = 0x8800 // VIC controller registers (3 bytes)
+	colorBase = 0xA000 // VIC color plane  (520 bytes, in 1 KB block)
+	charBase  = 0xA400 // VIC char plane   (520 bytes, in 1 KB block)
+	ctrlBase  = 0xA800 // VIC controller registers (16 bytes, in 1 KB CS block)
+	viaBase   = 0xB000 // 6522 VIA #1 (own 256-byte CS; mirrors every 16 bytes)
 	dispW     = 40
 	dispH     = 13
 	romBase   = 0xE000
@@ -88,10 +92,14 @@ func autoTune(backend cpu.Backend, budget time.Duration) int {
 const tickPeriod = 50 * time.Millisecond
 
 func main() {
-	cpuFlag := flag.String("cpu", "netsim", "CPU backend: netsim or interp")
-	runFlag := flag.Bool("run", false, "start the clock running immediately")
-	speedFlag := flag.String("speed", "", "starting clock speed: 1, 10, 100, 1k (or 1000), max")
-	batchFlag := flag.Int("batch", 0, "max HalfSteps per UI tick (0 = default 500). Raise for interp; lower if UI is janky.")
+	// Defaults are tuned for "open the TUI, see the demo running".
+	// Interp is fast enough to make the marquee look alive without
+	// the user having to tweak anything; -cpu=netsim opts into the
+	// transistor-level backend for visualization.
+	cpuFlag := flag.String("cpu", "interp", "CPU backend: interp or netsim")
+	runFlag := flag.Bool("run", true, "start the clock running immediately (default true)")
+	speedFlag := flag.String("speed", "max", "starting clock speed: 1, 10, 100, 1k (or 1000), max")
+	batchFlag := flag.Int("batch", 0, "max HalfSteps per UI tick (0 = auto-tune at startup based on the chosen backend)")
 	cpuProfile := flag.String("cpuprofile", "", "write CPU profile to file (active for the lifetime of the process)")
 	memProfile := flag.String("memprofile", "", "write heap profile to file at exit")
 	flag.Parse()
@@ -149,12 +157,20 @@ func main() {
 
 	dispCtrl := display.NewController("display.ctrl", ctrlBase, colorPlane, charPlane)
 
-	must(mainROM.Load(0, demos.Marquee))
+	// 6522 VIA #1 — clocked from its own 1 MHz oscillator. Demos use
+	// Timer 1 in free-running mode to pace animation. Independent of
+	// CPU clock, so it keeps running while stepping or paused — same
+	// as a real W65C22S board with a separate timer crystal.
+	via1 := via.New("via1", viaBase, 1_000_000)
+
+	bootDemo := demos.MarqueeDemo
+	must(mainROM.Load(0, bootDemo.Bytes))
 	must(mainROM.SetResetVector(0xE000))
 	must(b.Register(mainRAM))
 	must(b.Register(colorPlane))
 	must(b.Register(charPlane))
 	must(b.Register(dispCtrl))
+	must(b.Register(via1))
 	must(b.Register(mainROM))
 
 	// CPU backend — mutable so the CPU menu can swap it at runtime.
@@ -206,6 +222,22 @@ func main() {
 		return backend.Registers().PC, true
 	}
 
+	// Hardware-symbol harvest from any bus.Labeller component (VIC,
+	// VIA). Merged with each demo's program-local symbols so the
+	// memory window's Labels view annotates both regions.
+	hwSyms := []asm.Symbol{}
+	for _, c := range innerBus.Components() {
+		if l, ok := c.(bus.Labeller); ok {
+			hwSyms = append(hwSyms, l.Symbols()...)
+		}
+	}
+	mergeSymbols := func(demoSyms []asm.Symbol) []asm.Symbol {
+		out := make([]asm.Symbol, 0, len(demoSyms)+len(hwSyms))
+		out = append(out, demoSyms...)
+		out = append(out, hwSyms...)
+		return out
+	}
+
 	cpuProv := &cpuwin.Provider{Backend: backend}
 	cpuWindow := addWindow(cpuTitle,
 		foxpro.Rect{X: 2, Y: 1, W: 38, H: 13},
@@ -220,6 +252,8 @@ func main() {
 		Length:       0x100,
 		Highlight:    pcHighlight,
 		EditableBase: true,
+		Symbols:      mergeSymbols(bootDemo.Symbols),
+		Annotations:  bootDemo.Annotations,
 	}
 	memWin := addWindow("Memory",
 		foxpro.Rect{X: 42, Y: 1, W: 76, H: 14},
@@ -236,6 +270,8 @@ func main() {
 		Highlight:    pcHighlight,
 		EditableBase: true,
 		View:         ramwin.ViewDisasm,
+		Symbols:      mergeSymbols(bootDemo.Symbols),
+		Annotations:  bootDemo.Annotations,
 	}
 	romWin := addWindow("Memory",
 		foxpro.Rect{X: 42, Y: 16, W: 76, H: 8},
@@ -244,19 +280,37 @@ func main() {
 	romProv.Window = romWin
 
 	clockProv := clockwin.NewProvider(backend)
-	clockProv.MaxBatch = *batchFlag
+	if *batchFlag > 0 {
+		clockProv.MaxBatch = *batchFlag
+	} else {
+		// Auto-tune at startup: pick a batch size that lands the
+		// per-tick cost at ~70% of the 50 ms UI tick. Keeps the UI
+		// responsive while letting fast backends (interp) cruise.
+		clockProv.MaxBatch = autoTune(backend, 35*time.Millisecond)
+	}
 	addWindow("Clock",
 		foxpro.Rect{X: 2, Y: 13, W: 38, H: 7},
 		clockProv,
 		clockwin.MinW, clockwin.MinH)
 
-	// machineReset = full simulated-machine restart: stop clock, drop
-	// VIC pause, clear RAM, repaint display, reset CPU. ROM stays
-	// loaded with the current demo so reset starts that demo over.
+	viaProv := &viawin.Provider{VIA: via1, Base: viaBase}
+	addWindow("VIA #1",
+		foxpro.Rect{X: 2, Y: 21, W: 56, H: 20},
+		viaProv,
+		viawin.MinW, viawin.MinH)
+
+	// machineReset = full simulated-machine restart: drop VIC pause,
+	// clear RAM, reset peripherals, repaint display, reset CPU. ROM
+	// stays loaded with the current demo so reset starts it over.
+	//
+	// Modeled on a real hardware reset button: the clock keeps
+	// running. If the user had the simulator running, it stays
+	// running and the demo restarts immediately. If it was stopped,
+	// it stays stopped until the user hits R.
 	machineReset := func() {
-		clockProv.SetRunning(false)
 		b.Write(ctrlBase+display.RegPause, 0)
 		mainRAM.Reset()
+		via1.Reset()
 		paintInitialDisplay()
 		clockProv.Reset()
 	}
@@ -283,7 +337,11 @@ func main() {
 		// Hex strip can only scroll across the VIC's own memory:
 		// color plane through the last controller register.
 		MemRangeStart: colorBase,
-		MemRangeEnd:   ctrlBase + 6,
+		// Stop at the last controller register — must NOT extend
+		// into VIA territory at $A810+, because reading T1C-L on
+		// the bus clears IFR T1, which would race the CPU's polling
+		// loop to ack the timer.
+		MemRangeEnd: ctrlBase + 8,
 	}
 	// Layout: display + button column on top, hex-dump half-box below.
 	// Half-box adds left │ + scrollbar on right and top/bottom rules:
@@ -300,9 +358,19 @@ func main() {
 	// Run loop. App.Tick fires on the UI thread, so simulator
 	// advancement, register reads, and bus reads all serialize
 	// naturally — no locks needed.
+	// Sub-tick: split each app.Tick into N slices, advancing CPU and
+	// then the bus's Tickers in each slice. Without this, polling-
+	// based demos (those that LDA / poll a peripheral flag in a tight
+	// loop) only see flag transitions at app.Tick boundaries — so a
+	// large CPU batch can spend the whole batch in a wait loop, never
+	// observing the VIA timer underflow that's about to come.
+	const subTicks = 10
+	subPeriod := tickPeriod / subTicks
 	app.Tick(tickPeriod, func() {
-		clockProv.Advance(tickPeriod)
-		b.Tick() // age the read/write trace
+		for i := 0; i < subTicks; i++ {
+			clockProv.Advance(subPeriod)
+			b.Tick(subPeriod)
+		}
 	})
 
 	// Global key bindings. Active in any focused window so the user
@@ -345,9 +413,15 @@ func main() {
 		// Resume the VIC so a previous framed demo's pause state
 		// doesn't leak into a live demo.
 		b.Write(ctrlBase+display.RegPause, 0)
+		via1.Reset()
 		mainROM.Clear()
 		_ = mainROM.Load(0, d.Bytes)
 		_ = mainROM.SetResetVector(0xE000)
+		merged := mergeSymbols(d.Symbols)
+		ramProv.Symbols = merged
+		ramProv.Annotations = d.Annotations
+		romProv.Symbols = merged
+		romProv.Annotations = d.Annotations
 		paintInitialDisplay()
 		clockProv.Reset()
 	}
@@ -375,12 +449,28 @@ func main() {
 		cpuWindow.Title = fmt.Sprintf("CPU (%s)", name)
 	}
 
+	// Build the Demo menu, skipping any demo whose RequiresGraphics
+	// flag is set — the terminal build has no high-res pixel plane,
+	// so those would load but render nothing visible. The wasm
+	// build (cmd/6502-wasm) shows everything.
 	demoItems := []foxpro.MenuItem{}
-	for sIdx, sec := range demos.Sections() {
-		if sIdx > 0 {
+	first := true
+	for _, sec := range demos.Sections() {
+		picked := []demos.Demo{}
+		for _, d := range sec.Demos {
+			if d.RequiresGraphics {
+				continue
+			}
+			picked = append(picked, d)
+		}
+		if len(picked) == 0 {
+			continue
+		}
+		if !first {
 			demoItems = append(demoItems, foxpro.MenuItem{Separator: true})
 		}
-		for _, d := range sec.Demos {
+		first = false
+		for _, d := range picked {
 			d := d
 			demoItems = append(demoItems, foxpro.MenuItem{
 				Label:    d.Name,

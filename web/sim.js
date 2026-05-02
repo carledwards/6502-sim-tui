@@ -90,6 +90,20 @@
   const pixelLayerCanvases = new Map();
   let pixelBuf = null;
 
+  // Bg colors that should "tint" pixel-canvas content rather than
+  // overwrite it. Refreshed per frame from foxproWasm.pixelTintColors().
+  // Currently this is the active theme's drop-shadow bg color, so a
+  // foxpro drop shadow that lands on a sentinel cell appears as a
+  // darkening of the underlying canvas pixel instead of an opaque
+  // rectangle. The mask only fires on cells whose rune is still the
+  // pixel-canvas sentinel — meaning foxpro called shadeCell (which
+  // preserves the rune) rather than fillRect (which overwrites it
+  // with ' '). So drop shadows tint; window bodies and frames do
+  // not. Z-order is preserved: a window dragged over the canvas
+  // still fully covers it.
+  let tintColorSet = null;
+  const TINT_OVERLAY = 'rgba(0, 0, 0, 0.7)';
+
   function frame() {
     if (stopped) return;
     requestAnimationFrame(frame);
@@ -119,6 +133,15 @@
         off += 16;
         paintCell(x, y, ch, fg, bg);
       }
+    }
+
+    // Refresh tint colors once per frame — typically a single entry
+    // (the active theme's shadow bg). A Set lets the inner loop do an
+    // O(1) membership test per cell.
+    if (typeof fw.pixelTintColors === 'function') {
+      tintColorSet = new Set(fw.pixelTintColors() || []);
+    } else {
+      tintColorSet = null;
     }
 
     // Pixel-layer substitution pass.
@@ -155,9 +178,16 @@
       const clamped = new Uint8ClampedArray(pixelBuf.buffer, pixelBuf.byteOffset, need);
       entry.ctx.putImageData(new ImageData(clamped, L.pxW, L.pxH), 0, 0);
 
-      // Per-cell substitution — only draw at sentinel cells. Maps
-      // the body rect (cellW × cellH cells) onto the layer's pixel
-      // buffer (pxW × pxH) so each cell shows its matching slice.
+      // Per-cell substitution. Only sentinel cells get pixel
+      // content drawn — non-sentinel cells were overwritten by an
+      // upper window's frame or body and stay opaque.
+      //
+      // Tint pass: if a sentinel cell's foxpro bg matches a tint
+      // color (theme.Shadow), draw pixel + translucent overlay so
+      // the drop shadow appears as a darkening of the canvas
+      // instead of an opaque rectangle. Foxpro's shadeCell
+      // preserves runes; fillRect doesn't. So shadows tint;
+      // window bodies / frames don't.
       const subW = L.pxW / L.cellW;
       const subH = L.pxH / L.cellH;
       for (let cy = 0; cy < L.cellH; cy++) {
@@ -169,11 +199,18 @@
           const off = (screenY * w + screenX) * 16;
           const ch = view.getUint32(off, true);
           if (ch !== PIXEL_SENTINEL) continue;
+          const bg = view.getUint32(off + 8, true);
+          const px = screenX * cellW;
+          const py = screenY * CELL_H;
           ctx.drawImage(
             entry.canvas,
             cx * subW, cy * subH, subW, subH,
-            screenX * cellW, screenY * CELL_H, cellW, CELL_H,
+            px, py, cellW, CELL_H,
           );
+          if (tintColorSet && tintColorSet.has(bg)) {
+            ctx.fillStyle = TINT_OVERLAY;
+            ctx.fillRect(px, py, cellW, CELL_H);
+          }
         }
       }
     }
@@ -235,11 +272,17 @@
     return true;
   }
 
-  function colorToCSS(c, fallback) {
-    if (c === DEFAULT_COLOR_SENTINEL) return fallback;
+  function colorToCSS(c, fallback, alpha) {
+    if (c === DEFAULT_COLOR_SENTINEL) {
+      if (alpha == null) return fallback;
+      // Fallback path: parse the # form. The default-bg fallback uses
+      // a fixed CSS color so it's fine to skip alpha there in practice.
+      return fallback;
+    }
     const r = (c >> 16) & 0xff;
     const g = (c >> 8) & 0xff;
     const b = c & 0xff;
+    if (alpha != null) return `rgba(${r},${g},${b},${alpha})`;
     return `rgb(${r},${g},${b})`;
   }
 
