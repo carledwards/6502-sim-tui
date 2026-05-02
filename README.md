@@ -17,6 +17,8 @@ to real silicon unmodified.
 
 ## Screenshots
 
+![6502-sim-tui](docs/images/screen-3.gif)
+
 ![6502-sim-tui](docs/images/screen-1.gif)
 
 ![6502-sim-tui](docs/images/screen-2.gif)
