@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>6502 Sim — browser build</title>
+<style>
+  :root {
+    --bg: #111;
+    --fg: #eee;
+    --muted: #888;
+    --accent: #4a9;
+    --rule: #2a2a2a;
+    --panel: #181818;
+    --tag: #b87333;
+  }
+  html, body {
+    margin: 0;
+    padding: 0;
+    background: var(--bg);
+    color: var(--fg);
+    font-family: -apple-system, system-ui, sans-serif;
+    min-height: 100%;
+  }
+  #wrap {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 12px 12px 32px;
+    box-sizing: border-box;
+  }
+  #status {
+    font-size: 12px;
+    color: var(--muted);
+    margin-bottom: 8px;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  /* --- CRT-monitor-style bezel around the canvas --- */
+  .crt {
+    padding: 14px;
+    border-radius: 14px;
+    background:
+      linear-gradient(180deg, #2c2c2c 0%, #1a1a1a 60%, #141414 100%);
+    /* layered shadows: inner highlight + bottom inset shadow for the
+       plastic-bezel feel; large soft outer drop for elevation off
+       the page; tighter near-shadow for contact */
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.06),
+      inset 0 -2px 6px rgba(0, 0, 0, 0.55),
+      0 1px 0 rgba(255, 255, 255, 0.04),
+      0 6px 14px rgba(0, 0, 0, 0.55),
+      0 28px 70px rgba(0, 0, 0, 0.7);
+    transition: box-shadow 120ms ease-out;
+  }
+  /* glow up the bezel when the canvas takes focus — same accent we
+     used for the old focus outline, but on the frame */
+  .crt:has(canvas:focus) {
+    box-shadow:
+      inset 0 1px 0 rgba(255, 255, 255, 0.08),
+      inset 0 -2px 6px rgba(0, 0, 0, 0.55),
+      0 0 0 1px var(--accent),
+      0 0 18px rgba(74, 153, 153, 0.35),
+      0 28px 70px rgba(0, 0, 0, 0.7);
+  }
+  canvas {
+    background: #000;
+    image-rendering: pixelated;
+    outline: none;
+    display: block;
+    border-radius: 4px;
+    /* faint inner edge so the screen reads as recessed into the bezel */
+    box-shadow:
+      inset 0 0 0 1px rgba(255, 255, 255, 0.05),
+      inset 0 0 24px rgba(0, 0, 0, 0.6);
+    max-width: calc(100vw - 28px);
+    max-height: calc(100vh - 90px);
+    height: auto;
+  }
+
+  /* --- info section below canvas --- */
+  .info {
+    width: 100%;
+    max-width: 1100px;
+    margin-top: 28px;
+    padding: 0 8px;
+    box-sizing: border-box;
+  }
+  .info h1 {
+    font-size: 14px;
+    margin: 0 0 6px;
+    letter-spacing: 0.06em;
+    color: var(--accent);
+    text-transform: uppercase;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  .info p {
+    margin: 0 0 14px;
+    line-height: 1.5;
+    font-size: 14px;
+    color: #ccc;
+  }
+  .info p strong { color: var(--fg); }
+  .info code {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12.5px;
+    background: #000;
+    color: #d8c070;
+    padding: 1px 5px;
+    border-radius: 3px;
+  }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    gap: 12px;
+    margin-top: 6px;
+  }
+  .card {
+    background: var(--panel);
+    border: 1px solid var(--rule);
+    border-radius: 4px;
+    padding: 12px 14px;
+  }
+  /* Span the full grid width — useful for cards with longer content
+     that would otherwise leave a lopsided gap below the row. */
+  .card.wide { grid-column: 1 / -1; }
+  .card.wide ul { columns: 2; column-gap: 24px; }
+  @media (max-width: 720px) { .card.wide ul { columns: 1; } }
+  .card h2 {
+    margin: 0 0 8px;
+    font-size: 12px;
+    letter-spacing: 0.08em;
+    text-transform: uppercase;
+    color: var(--accent);
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+  }
+  .card p, .card li {
+    margin: 0 0 6px;
+    line-height: 1.45;
+    font-size: 13.5px;
+    color: #ccc;
+  }
+  .card ul {
+    margin: 0;
+    padding-left: 18px;
+  }
+  .tag {
+    display: inline-block;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 11px;
+    color: var(--tag);
+    border: 1px solid var(--tag);
+    padding: 1px 6px;
+    border-radius: 3px;
+    margin-right: 6px;
+    vertical-align: middle;
+  }
+  table.memmap {
+    width: 100%;
+    border-collapse: collapse;
+    font-family: ui-monospace, "SF Mono", Menlo, monospace;
+    font-size: 12.5px;
+  }
+  table.memmap th, table.memmap td {
+    text-align: left;
+    padding: 3px 8px 3px 0;
+    border-bottom: 1px dotted #2a2a2a;
+    color: #ccc;
+    vertical-align: top;
+  }
+  table.memmap th {
+    color: var(--muted);
+    font-weight: normal;
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+  table.memmap td.addr { color: #d8c070; white-space: nowrap; }
+  table.memmap tr.dim td { color: #666; }
+  .lede {
+    font-size: 14px;
+    color: #c8c8c8;
+    line-height: 1.55;
+    max-width: 880px;
+  }
+  .lede em { color: var(--accent); font-style: normal; }
+  hr.sep {
+    border: 0;
+    border-top: 1px solid var(--rule);
+    margin: 24px 0 16px;
+  }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="status">loading…</div>
+  <div class="crt">
+    <canvas id="screen" tabindex="0"></canvas>
+  </div>
+
+  <section class="info">
+    <h1>About this thing</h1>
+    <p class="lede">
+      A working <strong>MOS 6502</strong> microcomputer simulator running entirely in your browser
+      &mdash; CPU, RAM, ROM, video chip, and a real <strong>6522 VIA</strong> peripheral, all wired
+      to a memory-mapped bus. The <em>same code</em> runs as a terminal app and as this WebAssembly build.
+      Long-term goal: a teaching tool for how 6502-era machines actually worked &mdash; chip selects,
+      memory-mapped I/O, polling vs. interrupts, and writing assembly that transfers to real silicon.
+    </p>
+
+    <hr class="sep">
+
+    <div class="grid">
+      <div class="card">
+        <h2>How it's built</h2>
+        <ul>
+          <li><span class="tag">Go</span> One simulator core, two front-ends.</li>
+          <li><span class="tag">TUI</span> Native build runs in a real terminal via tcell.</li>
+          <li><span class="tag">WASM</span> The browser build compiles the same code with <code>GOOS=js</code> and renders the TUI to a canvas.</li>
+          <li>Graphics-mode pixels overlay the cell grid using a sentinel-rune trick &mdash; so windows, shadows, and z-order all <em>just work</em> over the bitmap.</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h2>The FoxPro UI</h2>
+        <p>
+          Windows, menus, status bar, drop shadows, drag-to-move &mdash; this is
+          <strong>foxpro-go</strong>, a from-scratch homage to FoxPro for DOS's TUI
+          (and dBASE before it). The simulator embeds it as the host shell.
+        </p>
+        <p>
+          Try: <code>F10</code> opens the menu bar. Drag any window by its
+          title. Right-click on the desktop to drag the whole layout.
+        </p>
+      </div>
+
+      <div class="card">
+        <h2>What's in the machine</h2>
+        <ul>
+          <li><strong>CPU</strong> &mdash; two backends: a fast interpreter and a transistor-level netlist sim.</li>
+          <li><strong>VIC</strong> &mdash; 40&times;13 char/color planes plus a 160&times;100 4-bpp graphics plane with hardware blits, fills, lines, and circles.</li>
+          <li><strong>VIA #1</strong> &mdash; 65C22 chip with Timer&nbsp;1 free-running on its own 1&nbsp;MHz oscillator, IFR/IER, polling-style pacing.</li>
+          <li><strong>RAM/ROM</strong> &mdash; 8&nbsp;KB each, reset vector at <code>$FFFC</code>.</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h2>Memory map</h2>
+        <table class="memmap">
+          <tr><th>Range</th><th>Device</th></tr>
+          <tr><td class="addr">$0000-$1FFF</td><td>RAM (8&nbsp;KB)</td></tr>
+          <tr class="dim"><td class="addr">$2000-$9FFF</td><td>open / expansion</td></tr>
+          <tr><td class="addr">$A000-$A3FF</td><td>VIC color plane</td></tr>
+          <tr><td class="addr">$A400-$A7FF</td><td>VIC char plane</td></tr>
+          <tr><td class="addr">$A800-$ABFF</td><td>VIC controller</td></tr>
+          <tr><td class="addr">$B000-$B0FF</td><td>6522 VIA #1</td></tr>
+          <tr class="dim"><td class="addr">$B100-$BFFF</td><td>peripheral slots (15&times;)</td></tr>
+          <tr><td class="addr">$C000-$DFFF</td><td>VIC graphics plane</td></tr>
+          <tr><td class="addr">$E000-$FFFF</td><td>ROM</td></tr>
+        </table>
+      </div>
+
+      <div class="card">
+        <h2>Try this</h2>
+        <ul>
+          <li>Open <strong>Demo</strong> menu &mdash; bouncing balls, scrollers, a graphics quad-rotator.</li>
+          <li>Open <strong>VIA #1</strong> window: watch the timer count down even when you stop the CPU.</li>
+          <li>Open <strong>Memory</strong>: hit <code>v</code> to cycle Hex / Disasm / Labels.</li>
+          <li><strong>Type</strong> a base address in Memory to navigate &mdash; e.g. <code>$B000</code> to inspect the VIA.</li>
+        </ul>
+      </div>
+
+      <div class="card">
+        <h2>Hardware-faithful intent</h2>
+        <p>
+          Each peripheral lives on its own chip-select region, decoded by high
+          address bits exactly the way a 74HC138 would on a real board.
+          The VIA's registers <em>mirror</em> every 16 bytes through its
+          256-byte CS block &mdash; same as a real 65C22 with only 4 register-select pins.
+          The intent: demos written here transfer to real silicon unmodified.
+        </p>
+      </div>
+
+      <div class="card wide">
+        <h2>What's on screen</h2>
+        <ul>
+          <li><strong>CPU</strong> &mdash; live A/X/Y/PC, status flags, half-cycle counter, address &amp; data buses, R/W direction, IRQ/NMI lines. Reset button on the right.</li>
+          <li><strong>Clock</strong> &mdash; Run, Stop, Step (one instruction), Tick (one half-cycle), and a speed selector (1 Hz &rarr; Max). The pacemaker for the whole machine.</li>
+          <li><strong>VIC</strong> &mdash; the video chip's framebuffer (text or graphics mode), with a column of buttons for every controller command (Clear, Shifts, Rotates, Fills). Drag-to-scroll the memory strip below.</li>
+          <li><strong>VIA #1</strong> &mdash; the 6522 timer/peripheral chip. Counter ticks down on its own crystal (independent of the CPU clock), IFR/IER bit dots flicker as the timer fires. Watch it stay alive while you single-step.</li>
+          <li><strong>Memory</strong> &mdash; hex view, with trace tinting (yellow = changed write, green = read). Press <code>v</code> to cycle Hex / Disasm / Labels.</li>
+        </ul>
+      </div>
+    </div>
+
+    <hr class="sep">
+    <p style="font-size: 12px; color: var(--muted); text-align: center; margin: 0;">
+      Carl Edwards &middot;
+      <a href="https://thecarledwards.com">thecarledwards.com</a>
+    </p>
+  </section>
+</div>
+<script src="wasm_exec.js"></script>
+<script src="sim.js"></script>
+</body>
+</html>

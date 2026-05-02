@@ -11,17 +11,21 @@ import (
 
 	foxpro "github.com/carledwards/foxpro-go"
 
+	"github.com/carledwards/6502-sim-tui/asm"
 	"github.com/carledwards/6502-sim-tui/bus"
 	"github.com/carledwards/6502-sim-tui/components/display"
 	"github.com/carledwards/6502-sim-tui/components/ram"
 	"github.com/carledwards/6502-sim-tui/components/rom"
+	"github.com/carledwards/6502-sim-tui/components/via"
 	"github.com/carledwards/6502-sim-tui/cpu"
 	"github.com/carledwards/6502-sim-tui/cpu/interp"
 	"github.com/carledwards/6502-sim-tui/cpu/netsim"
+	"github.com/carledwards/6502-sim-tui/internal/demos"
 	"github.com/carledwards/6502-sim-tui/ui/clockwin"
 	"github.com/carledwards/6502-sim-tui/ui/cpuwin"
 	"github.com/carledwards/6502-sim-tui/ui/displaywin"
 	"github.com/carledwards/6502-sim-tui/ui/ramwin"
+	"github.com/carledwards/6502-sim-tui/ui/viawin"
 
 	"github.com/gdamore/tcell/v2"
 )
@@ -39,23 +43,15 @@ import (
 const (
 	ramBase   = 0x0000
 	ramSize   = 0x2000 // 8 KB at $0000-$1FFF
-	colorBase = 0x8200 // VIC color plane (520 bytes)
-	charBase  = 0x8500 // VIC char plane  (520 bytes)
-	ctrlBase  = 0x8800 // VIC controller registers (3 bytes)
+	colorBase = 0xA000 // VIC color plane  (520 bytes, in 1 KB block)
+	charBase  = 0xA400 // VIC char plane   (520 bytes, in 1 KB block)
+	ctrlBase  = 0xA800 // VIC controller registers (16 bytes, in 1 KB CS block)
+	viaBase   = 0xB000 // 6522 VIA #1 (own 256-byte CS; mirrors every 16 bytes)
 	dispW     = 40
 	dispH     = 13
 	romBase   = 0xE000
 	romSize   = 0x2000
 )
-
-// demo is one selectable ROM payload. Each demo starts at $E000;
-// the reset vector is wired to point there. Switching demos at
-// runtime: clear the ROM, load the new bytes, set the reset vector,
-// repaint the host-side display init pattern, then Reset the CPU.
-type demo struct {
-	name  string
-	bytes []uint8
-}
 
 // Memory map a demo author should know:
 //   $0000-$1FFF  RAM (8 KB)
@@ -64,293 +60,6 @@ type demo struct {
 //   $8800-$8802  VIC controller   (cmd / pause / frame)
 //   $E000-$FFFF  ROM (program loaded here, reset vector at $FFFC)
 
-// Demo program — "HELLO 6502 SIM" marquee.
-//
-// Setup phase:
-//   1. Clear the display via the controller.
-//   2. Copy a 14-byte message into row 6 of the char plane
-//      ($05F0..$05FD) and paint that range navy-bg/yellow-fg in the
-//      color plane ($02F0..$02FD).
-//
-// Steady state:
-//   loop forever: poke CmdRotLeft into $0800.
-//
-// All rows rotate independently each iteration, so the host's
-// initial diagonal-gradient pattern keeps shifting in the rows above
-// and below the message.
-//
-//	$E000  LDA #$01         ; A9 01
-//	$E002  STA $0800        ; 8D 00 08      controller: clear
-//	$E005  LDX #$00         ; A2 00
-//	$E007  LDA $E01F,X      ; BD 1F E0      msg[X]
-//	$E00A  STA $05F0,X      ; 9D F0 05      char[row6+X] = msg[X]
-//	$E00D  LDA #$1E         ; A9 1E
-//	$E00F  STA $02F0,X      ; 9D F0 02      color: bg navy, fg yellow
-//	$E012  INX              ; E8
-//	$E013  CPX #$0E         ; E0 0E         14 chars
-//	$E015  BNE $E007        ; D0 F0
-//	$E017  LDA #$07         ; A9 07
-//	$E019  STA $0800        ; 8D 00 08      controller: rot left
-//	$E01C  JMP $E017        ; 4C 17 E0
-//	$E01F  "HELLO 6502 SIM" ; 14 bytes
-var demoProg = []uint8{
-	// Clear screen via controller @ $8800.
-	0xA9, 0x01,
-	0x8D, 0x00, 0x88,
-
-	// Copy message + paint color into row 6.
-	0xA2, 0x00, // LDX #$00
-	0xBD, 0x1F, 0xE0, // LDA $E01F,X      (msg+X)
-	0x9D, 0xF0, 0x85, // STA $85F0,X      (char plane row 6)
-	0xA9, 0x1E, //       LDA #$1E         (bg=navy, fg=yellow)
-	0x9D, 0xF0, 0x82, // STA $82F0,X      (color plane row 6)
-	0xE8,             // INX
-	0xE0, 0x0E,       // CPX #14
-	0xD0, 0xF0,       // BNE -16          (back to LDA msg)
-
-	// Forever-scroll: poke CmdRotLeft (= $07) to controller @ $8800.
-	0xA9, 0x07,
-	0x8D, 0x00, 0x88,
-	0x4C, 0x17, 0xE0, // JMP back to LDA #$07
-
-	// Message bytes at $E01F.
-	'H', 'E', 'L', 'L', 'O', ' ', '6', '5', '0', '2', ' ', 'S', 'I', 'M',
-}
-
-// Bouncer — a single colored '*' bounces left-and-right across row 6,
-// erasing its trail. ZP[$00] = x, ZP[$01] = direction (+1/-1).
-//
-// Includes a Y-counter delay loop after each move so motion is
-// visible regardless of clock speed (without it, at high batch sizes
-// the cell crosses the row faster than the eye can track).
-var bouncerProg = []uint8{
-	// Setup: clear, init x=20, dx=+1.
-	0xA9, 0x01, 0x8D, 0x00, 0x88, // LDA #$01 ; STA $8800   (clear)
-	0xA2, 0x14, 0x86, 0x00,       // LDX #20  ; STX $00     (x=20)
-	0xA9, 0x01, 0x85, 0x01,       // LDA #1   ; STA $01     (dx=+1)
-
-	// Loop @ $E00D
-	0xA6, 0x00,                   // LDX $00
-	0xA9, 0x20, 0x9D, 0xF0, 0x85, // LDA #' ' ; STA $85F0,X  (erase char)
-	0xA9, 0x00, 0x9D, 0xF0, 0x82, // LDA #0   ; STA $82F0,X  (erase color)
-
-	// Move: dx>=0 → INX, else DEX.
-	0xA5, 0x01, 0x10, 0x04,       // LDA $01 ; BPL +4
-	0xCA, 0x4C, 0x22, 0xE0,       // DEX ; JMP $E022
-	0xE8,                         // INX
-	0x86, 0x00,                   // STX $00
-
-	// Draw: '*' at row 6 col x.
-	0xA9, 0x2A, 0x9D, 0xF0, 0x85, // LDA #'*' ; STA $85F0,X
-	0xA9, 0x1E, 0x9D, 0xF0, 0x82, // LDA #$1E ; STA $82F0,X (navy/yellow)
-
-	// Delay — Y counts down from $FF, ~256 iterations.
-	0xA0, 0xFF,                   // LDY #$FF
-	0x88, 0xD0, 0xFD,             // DEY ; BNE -3
-
-	// Bounds: if X==0 or X==39, jump to flip @ $E03E.
-	0xE0, 0x00, 0xF0, 0x07,       // CPX #0  ; BEQ +7
-	0xE0, 0x27, 0xF0, 0x03,       // CPX #39 ; BEQ +3
-	0x4C, 0x0D, 0xE0,             // JMP loop
-
-	// Flip @ $E03E: dx = -dx.
-	0xA5, 0x01, 0x49, 0xFF,       // LDA $01 ; EOR #$FF
-	0x18, 0x69, 0x01,             // CLC ; ADC #1
-	0x85, 0x01,                   // STA $01
-	0x4C, 0x0D, 0xE0,             // JMP loop
-}
-
-// Scroller — fills the bottom row (row 12, offsets $1E0..$207) with
-// a varying gradient (cell value = X + counter), then pokes
-// CmdShiftUp. Each iteration: counter++, fill, shift. Result is a
-// continuously flowing diagonal pattern climbing up the screen.
-var scrollerProg = []uint8{
-	// Loop @ $E000
-	0xE6, 0x00,             // INC $00              (counter++)
-	0xA2, 0x00,             // LDX #0
-
-	// Fill bottom row @ $E004
-	0x8A,                   // TXA
-	0x18,                   // CLC
-	0x65, 0x00,             // ADC $00              (A = X + counter)
-	0x9D, 0xE0, 0x83,       // STA $83E0,X          (color[bottomrow + X])
-	0x9D, 0xE0, 0x86,       // STA $86E0,X          (char[bottomrow + X])
-	0xE8,                   // INX
-	0xE0, 0x28,             // CPX #40
-	0xD0, 0xF1,             // BNE fill (-15)
-
-	// Shift up via controller.
-	0xA9, 0x02,             // LDA #2               (CmdShiftUp)
-	0x8D, 0x00, 0x88,       // STA $8800
-
-	0x4C, 0x00, 0xE0,       // JMP loop
-}
-
-// Snow — fills the framebuffer with pseudo-random colored chars
-// from an 8-bit Galois LFSR (taps = $B8), pauses, clears via
-// controller, repeats. Two passes (256 cells each) cover the first
-// 512 cells of the display; the last 8 cells of row 12 remain blank.
-var snowProg = []uint8{
-	// Seed init @ $E000.
-	0xA9, 0x01, 0x85, 0x00,        // LDA #1 ; STA $00
-
-	// Outer loop @ $E004
-	0xA2, 0x00,                    // LDX #0
-
-	// Pass 1 @ $E006 — cells 0..255 (color $8200..$82FF, char $8500..$85FF).
-	0xA5, 0x00,                    // LDA $00
-	0x4A,                          // LSR A
-	0x90, 0x02,                    // BCC +2
-	0x49, 0xB8,                    // EOR #$B8
-	0x85, 0x00,                    // STA $00
-	0x9D, 0x00, 0x82,              // STA $8200,X
-	0x49, 0x5A,                    // EOR #$5A
-	0x9D, 0x00, 0x85,              // STA $8500,X
-	0xE8,                          // INX
-	0xD0, 0xEC,                    // BNE pass1 (-20)
-
-	// Pass 2 setup @ $E01A — cells 256..511 (color $8300..$83FF, char $8600..$86FF).
-	0xA2, 0x00,                    // LDX #0
-	0xA5, 0x00,                    // LDA $00
-	0x4A,                          // LSR A
-	0x90, 0x02,                    // BCC +2
-	0x49, 0xB8,                    // EOR #$B8
-	0x85, 0x00,                    // STA $00
-	0x9D, 0x00, 0x83,              // STA $8300,X
-	0x49, 0x5A,                    // EOR #$5A
-	0x9D, 0x00, 0x86,              // STA $8600,X
-	0xE8,                          // INX
-	0xD0, 0xEC,                    // BNE pass2 (-20)
-
-	// Delay @ $E030.
-	0xA0, 0x10,                    // LDY #$10
-	0xA2, 0xFF,                    // LDX #$FF
-	0xCA,                          // DEX
-	0xD0, 0xFD,                    // BNE d2 (-3)
-	0x88,                          // DEY
-	0xD0, 0xF8,                    // BNE d1 (-8)
-
-	// Clear via controller, then repeat.
-	0xA9, 0x01,                    // LDA #1
-	0x8D, 0x00, 0x88,              // STA $8800
-	0x4C, 0x04, 0xE0,              // JMP outer
-}
-
-// Blitter — classic double-buffer pattern. Build a 256-byte image
-// in off-screen RAM at $1000, then copy to both VIC planes, then
-// fire RegFrame. The user only ever sees fully-rendered frames.
-//
-//	$00     = counter, increments per frame
-//	$1000   = 256-byte off-screen buffer
-//	$0200   = color plane (first 256 cells get the buffer; rest stays
-//	          at host init)
-//	$0500   = char plane  (each byte is buffer[X] mapped into '@'..'_')
-//
-//	$E000  LDA #1    STA $0801   ; pause
-//	$E005  INC $00                       ← loop
-//	$E007  LDX #0
-//	$E009  TXA ; CLC ; ADC $00 ; STA $1000,X ; INX ; BNE     ← build
-//	$E013  LDX #0
-//	$E015  LDA $1000,X ; STA $0200,X ; INX ; BNE             ← blit color
-//	$E01E  LDX #0
-//	$E020  LDA $1000,X ; AND #$1F ; CLC ; ADC #'@' ; STA $0500,X
-//	       INX ; BNE                                          ← blit char
-//	$E02E  STA $0802                                          ← frame
-//	$E031  JMP loop
-var blitterProg = []uint8{
-	// Pause once @ $8801.
-	0xA9, 0x01, 0x8D, 0x01, 0x88, // LDA #1 ; STA $8801
-
-	// Loop: bump counter, init X.
-	0xE6, 0x00, // INC $00
-	0xA2, 0x00, // LDX #0
-
-	// Build off-screen image: buffer[X] = X + counter, in RAM at $1000.
-	0x8A,             // TXA
-	0x18,             // CLC
-	0x65, 0x00,       // ADC $00
-	0x9D, 0x00, 0x10, // STA $1000,X (RAM is one big block, scratch lives at $1000)
-	0xE8,             // INX
-	0xD0, 0xF6,       // BNE build (-10)
-
-	// Blit to color plane.
-	0xA2, 0x00,       // LDX #0
-	0xBD, 0x00, 0x10, // LDA $1000,X
-	0x9D, 0x00, 0x82, // STA $8200,X
-	0xE8,             // INX
-	0xD0, 0xF7,       // BNE blit_color (-9)
-
-	// Blit to char plane (mapped into '@'..'_').
-	0xA2, 0x00,       // LDX #0
-	0xBD, 0x00, 0x10, // LDA $1000,X
-	0x29, 0x1F,       // AND #$1F
-	0x18,             // CLC
-	0x69, 0x40,       // ADC #'@'
-	0x9D, 0x00, 0x85, // STA $8500,X
-	0xE8,             // INX
-	0xD0, 0xF2,       // BNE blit_char (-14)
-
-	// Frame trigger — commit the snapshot.
-	0x8D, 0x02, 0x88, // STA $8802
-
-	0x4C, 0x05, 0xE0, // JMP loop
-}
-
-// Scroller (framed) — uses the new VIC pause/frame registers.
-// Order: shift-up FIRST (so the bottom row gets blanked), then fill
-// the bottom row, then commit the frame. Every snapshot the UI sees
-// has a populated bottom row — no flicker, no black gap.
-//
-//	$0800 = command register   ($02 = ShiftUp)
-//	$0801 = pause state        (1 = paused)
-//	$0802 = frame trigger      (any write = snapshot)
-var scrollerFramedProg = []uint8{
-	// Pause once @ $8801.
-	0xA9, 0x01, 0x8D, 0x01, 0x88, // LDA #1 ; STA $8801
-
-	// Loop @ $E005 — shift first.
-	0xA9, 0x02, 0x8D, 0x00, 0x88, // LDA #$02 ; STA $8800 (CmdShiftUp)
-
-	0xE6, 0x00, // INC $00
-	0xA2, 0x00, // LDX #0
-
-	// Fill bottom row @ $E00E.
-	0x8A,             // TXA
-	0x18,             // CLC
-	0x65, 0x00,       // ADC $00
-	0x9D, 0xE0, 0x83, // STA $83E0,X
-	0x9D, 0xE0, 0x86, // STA $86E0,X
-	0xE8,             // INX
-	0xE0, 0x28,       // CPX #40
-	0xD0, 0xF1,       // BNE fill (-15 from $E01D → $E00E)
-
-	// Frame trigger.
-	0x8D, 0x02, 0x88, // STA $8802
-
-	0x4C, 0x05, 0xE0, // JMP loop
-}
-
-// demoSection is a labelled group of demos shown in the Demo menu.
-// Sections are separated by a Separator menu item.
-type demoSection struct {
-	demos []demo
-}
-
-// demoSections — first group is "live" (UI updates as memory changes),
-// second is "framed" (UI shows snapshot, CPU controls when to commit).
-var demoSections = []demoSection{
-	{[]demo{
-		{"&Marquee (default)", demoProg},
-		{"&Bouncer", bouncerProg},
-		{"&Scroller", scrollerProg},
-		{"S&now (LFSR)", snowProg},
-	}},
-	{[]demo{
-		{"Scroller (&framed)", scrollerFramedProg},
-		{"&Blitter (RAM→VIC)", blitterProg},
-		{"&Quadrants (4 scrolls)", quadProg},
-	}},
-}
 
 // tuneCandidates are the batch sizes auto-tune tries in order. They
 // are already round numbers, so the picked value is also "memorable"
@@ -383,10 +92,14 @@ func autoTune(backend cpu.Backend, budget time.Duration) int {
 const tickPeriod = 50 * time.Millisecond
 
 func main() {
-	cpuFlag := flag.String("cpu", "netsim", "CPU backend: netsim or interp")
-	runFlag := flag.Bool("run", false, "start the clock running immediately")
-	speedFlag := flag.String("speed", "", "starting clock speed: 1, 10, 100, 1k (or 1000), max")
-	batchFlag := flag.Int("batch", 0, "max HalfSteps per UI tick (0 = default 500). Raise for interp; lower if UI is janky.")
+	// Defaults are tuned for "open the TUI, see the demo running".
+	// Interp is fast enough to make the marquee look alive without
+	// the user having to tweak anything; -cpu=netsim opts into the
+	// transistor-level backend for visualization.
+	cpuFlag := flag.String("cpu", "interp", "CPU backend: interp or netsim")
+	runFlag := flag.Bool("run", true, "start the clock running immediately (default true)")
+	speedFlag := flag.String("speed", "max", "starting clock speed: 1, 10, 100, 1k (or 1000), max")
+	batchFlag := flag.Int("batch", 0, "max HalfSteps per UI tick (0 = auto-tune at startup based on the chosen backend)")
 	cpuProfile := flag.String("cpuprofile", "", "write CPU profile to file (active for the lifetime of the process)")
 	memProfile := flag.String("memprofile", "", "write heap profile to file at exit")
 	flag.Parse()
@@ -444,12 +157,20 @@ func main() {
 
 	dispCtrl := display.NewController("display.ctrl", ctrlBase, colorPlane, charPlane)
 
-	must(mainROM.Load(0, demoProg))
+	// 6522 VIA #1 — clocked from its own 1 MHz oscillator. Demos use
+	// Timer 1 in free-running mode to pace animation. Independent of
+	// CPU clock, so it keeps running while stepping or paused — same
+	// as a real W65C22S board with a separate timer crystal.
+	via1 := via.New("via1", viaBase, 1_000_000)
+
+	bootDemo := demos.MarqueeDemo
+	must(mainROM.Load(0, bootDemo.Bytes))
 	must(mainROM.SetResetVector(0xE000))
 	must(b.Register(mainRAM))
 	must(b.Register(colorPlane))
 	must(b.Register(charPlane))
 	must(b.Register(dispCtrl))
+	must(b.Register(via1))
 	must(b.Register(mainROM))
 
 	// CPU backend — mutable so the CPU menu can swap it at runtime.
@@ -480,6 +201,11 @@ func main() {
 	}
 	defer app.Close()
 
+	// Opt in to foxpro's standard CLEAR / HELP / QUIT / VER command-window
+	// commands. As of foxpro-go's switch to opt-in builtins, this call
+	// is required to keep the F2 command window populated.
+	foxpro.RegisterBuiltinCommands(app)
+
 	// Track every window we create so we can toggle visibility from
 	// a Window menu after the user closes one.
 	var windows []*foxpro.Window
@@ -496,6 +222,22 @@ func main() {
 		return backend.Registers().PC, true
 	}
 
+	// Hardware-symbol harvest from any bus.Labeller component (VIC,
+	// VIA). Merged with each demo's program-local symbols so the
+	// memory window's Labels view annotates both regions.
+	hwSyms := []asm.Symbol{}
+	for _, c := range innerBus.Components() {
+		if l, ok := c.(bus.Labeller); ok {
+			hwSyms = append(hwSyms, l.Symbols()...)
+		}
+	}
+	mergeSymbols := func(demoSyms []asm.Symbol) []asm.Symbol {
+		out := make([]asm.Symbol, 0, len(demoSyms)+len(hwSyms))
+		out = append(out, demoSyms...)
+		out = append(out, hwSyms...)
+		return out
+	}
+
 	cpuProv := &cpuwin.Provider{Backend: backend}
 	cpuWindow := addWindow(cpuTitle,
 		foxpro.Rect{X: 2, Y: 1, W: 38, H: 13},
@@ -510,6 +252,8 @@ func main() {
 		Length:       0x100,
 		Highlight:    pcHighlight,
 		EditableBase: true,
+		Symbols:      mergeSymbols(bootDemo.Symbols),
+		Annotations:  bootDemo.Annotations,
 	}
 	memWin := addWindow("Memory",
 		foxpro.Rect{X: 42, Y: 1, W: 76, H: 14},
@@ -526,6 +270,8 @@ func main() {
 		Highlight:    pcHighlight,
 		EditableBase: true,
 		View:         ramwin.ViewDisasm,
+		Symbols:      mergeSymbols(bootDemo.Symbols),
+		Annotations:  bootDemo.Annotations,
 	}
 	romWin := addWindow("Memory",
 		foxpro.Rect{X: 42, Y: 16, W: 76, H: 8},
@@ -534,19 +280,37 @@ func main() {
 	romProv.Window = romWin
 
 	clockProv := clockwin.NewProvider(backend)
-	clockProv.MaxBatch = *batchFlag
+	if *batchFlag > 0 {
+		clockProv.MaxBatch = *batchFlag
+	} else {
+		// Auto-tune at startup: pick a batch size that lands the
+		// per-tick cost at ~70% of the 50 ms UI tick. Keeps the UI
+		// responsive while letting fast backends (interp) cruise.
+		clockProv.MaxBatch = autoTune(backend, 35*time.Millisecond)
+	}
 	addWindow("Clock",
 		foxpro.Rect{X: 2, Y: 13, W: 38, H: 7},
 		clockProv,
 		clockwin.MinW, clockwin.MinH)
 
-	// machineReset = full simulated-machine restart: stop clock, drop
-	// VIC pause, clear RAM, repaint display, reset CPU. ROM stays
-	// loaded with the current demo so reset starts that demo over.
+	viaProv := &viawin.Provider{VIA: via1, Base: viaBase}
+	addWindow("VIA #1",
+		foxpro.Rect{X: 2, Y: 21, W: 56, H: 20},
+		viaProv,
+		viawin.MinW, viawin.MinH)
+
+	// machineReset = full simulated-machine restart: drop VIC pause,
+	// clear RAM, reset peripherals, repaint display, reset CPU. ROM
+	// stays loaded with the current demo so reset starts it over.
+	//
+	// Modeled on a real hardware reset button: the clock keeps
+	// running. If the user had the simulator running, it stays
+	// running and the demo restarts immediately. If it was stopped,
+	// it stays stopped until the user hits R.
 	machineReset := func() {
-		clockProv.SetRunning(false)
 		b.Write(ctrlBase+display.RegPause, 0)
 		mainRAM.Reset()
+		via1.Reset()
 		paintInitialDisplay()
 		clockProv.Reset()
 	}
@@ -573,7 +337,11 @@ func main() {
 		// Hex strip can only scroll across the VIC's own memory:
 		// color plane through the last controller register.
 		MemRangeStart: colorBase,
-		MemRangeEnd:   ctrlBase + 6,
+		// Stop at the last controller register — must NOT extend
+		// into VIA territory at $A810+, because reading T1C-L on
+		// the bus clears IFR T1, which would race the CPU's polling
+		// loop to ack the timer.
+		MemRangeEnd: ctrlBase + 8,
 	}
 	// Layout: display + button column on top, hex-dump half-box below.
 	// Half-box adds left │ + scrollbar on right and top/bottom rules:
@@ -590,9 +358,19 @@ func main() {
 	// Run loop. App.Tick fires on the UI thread, so simulator
 	// advancement, register reads, and bus reads all serialize
 	// naturally — no locks needed.
+	// Sub-tick: split each app.Tick into N slices, advancing CPU and
+	// then the bus's Tickers in each slice. Without this, polling-
+	// based demos (those that LDA / poll a peripheral flag in a tight
+	// loop) only see flag transitions at app.Tick boundaries — so a
+	// large CPU batch can spend the whole batch in a wait loop, never
+	// observing the VIA timer underflow that's about to come.
+	const subTicks = 10
+	subPeriod := tickPeriod / subTicks
 	app.Tick(tickPeriod, func() {
-		clockProv.Advance(tickPeriod)
-		b.Tick() // age the read/write trace
+		for i := 0; i < subTicks; i++ {
+			clockProv.Advance(subPeriod)
+			b.Tick(subPeriod)
+		}
 	})
 
 	// Global key bindings. Active in any focused window so the user
@@ -630,14 +408,20 @@ func main() {
 	// loadDemo swaps in a different ROM payload and resets the CPU.
 	// Also pokes CmdResume into the display controller so a previous
 	// framed demo's pause state doesn't leak into a live demo.
-	loadDemo := func(d demo) {
+	loadDemo := func(d demos.Demo) {
 		clockProv.SetRunning(false)
 		// Resume the VIC so a previous framed demo's pause state
 		// doesn't leak into a live demo.
 		b.Write(ctrlBase+display.RegPause, 0)
+		via1.Reset()
 		mainROM.Clear()
-		_ = mainROM.Load(0, d.bytes)
+		_ = mainROM.Load(0, d.Bytes)
 		_ = mainROM.SetResetVector(0xE000)
+		merged := mergeSymbols(d.Symbols)
+		ramProv.Symbols = merged
+		ramProv.Annotations = d.Annotations
+		romProv.Symbols = merged
+		romProv.Annotations = d.Annotations
 		paintInitialDisplay()
 		clockProv.Reset()
 	}
@@ -665,15 +449,31 @@ func main() {
 		cpuWindow.Title = fmt.Sprintf("CPU (%s)", name)
 	}
 
+	// Build the Demo menu, skipping any demo whose RequiresGraphics
+	// flag is set — the terminal build has no high-res pixel plane,
+	// so those would load but render nothing visible. The wasm
+	// build (cmd/6502-wasm) shows everything.
 	demoItems := []foxpro.MenuItem{}
-	for sIdx, sec := range demoSections {
-		if sIdx > 0 {
+	first := true
+	for _, sec := range demos.Sections() {
+		picked := []demos.Demo{}
+		for _, d := range sec.Demos {
+			if d.RequiresGraphics {
+				continue
+			}
+			picked = append(picked, d)
+		}
+		if len(picked) == 0 {
+			continue
+		}
+		if !first {
 			demoItems = append(demoItems, foxpro.MenuItem{Separator: true})
 		}
-		for _, d := range sec.demos {
+		first = false
+		for _, d := range picked {
 			d := d
 			demoItems = append(demoItems, foxpro.MenuItem{
-				Label:    d.name,
+				Label:    d.Name,
 				OnSelect: func() { loadDemo(d) },
 			})
 		}

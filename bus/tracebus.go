@@ -1,5 +1,7 @@
 package bus
 
+import "time"
+
 // TraceBus wraps a Bus and records the most-recent generation in
 // which each address was read or written. UI can query whether a
 // cell has been accessed recently for visualization.
@@ -53,9 +55,19 @@ func (t *TraceBus) Components() []Component    { return t.inner.Components() }
 // display reads.
 func (t *TraceBus) Inner() Bus { return t.inner }
 
-// Tick advances the generation counter. Call once per UI frame so
-// access freshness ages out over time.
-func (t *TraceBus) Tick() { t.gen++ }
+// Tick advances the generation counter and drives any Ticker
+// components attached to the underlying bus. Call once per UI frame
+// so access freshness ages out over time and any time-driven
+// peripherals (e.g. a 6522 VIA timer) advance on the host's
+// wall-clock — independent of CPU stepping or pause state.
+func (t *TraceBus) Tick(dt time.Duration) {
+	t.gen++
+	for _, c := range t.inner.Components() {
+		if tk, ok := c.(Ticker); ok {
+			tk.Tick(dt)
+		}
+	}
+}
 
 // RecentRead reports whether addr was read within `freshness`
 // generations of now. False if never accessed.

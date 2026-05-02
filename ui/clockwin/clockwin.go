@@ -68,6 +68,14 @@ func NewProvider(backend cpu.Backend) *Provider {
 	return p
 }
 
+// referenceTick is the canonical "one frame" duration the MaxBatch
+// figure is calibrated against. Run loops that sub-divide their
+// app.Tick callback into smaller slices pass the slice's elapsed,
+// and Advance scales the cap proportionally — so a 50 ms app.Tick
+// split into ten 5 ms sub-ticks runs the same total batch as one
+// 50 ms call, just spread across ten interleaved CPU/bus rounds.
+const referenceTick = 50 * time.Millisecond
+
 // Advance is called by the run loop on a fixed cadence.
 func (p *Provider) Advance(elapsed time.Duration) {
 	if !p.running {
@@ -79,10 +87,18 @@ func (p *Provider) Advance(elapsed time.Duration) {
 	}
 	hz := Speeds[p.speedIdx].Hz
 	if hz == 0 {
-		for i := 0; i < cap; i++ {
+		// Max mode: run cap HalfSteps per referenceTick, scaled by
+		// the actual elapsed window. Without this scaling, sub-tick
+		// run loops would multiply the effective rate by their slice
+		// count (e.g. 10× sub-ticks ⇒ 10× faster CPU).
+		n := int(float64(cap) * float64(elapsed) / float64(referenceTick))
+		if n < 1 {
+			n = 1
+		}
+		for i := 0; i < n; i++ {
 			p.Backend.HalfStep()
 		}
-		p.stepsDone += uint64(cap)
+		p.stepsDone += uint64(n)
 		return
 	}
 	p.accum += float64(hz*2) * elapsed.Seconds()
@@ -127,8 +143,13 @@ func (p *Provider) StepInstruction() {
 	}
 }
 
+// Reset performs a CPU-and-counters reset — Backend.Reset, plus
+// zeroing the fractional-cycle accumulator and the steps-done
+// counter. The running flag is intentionally NOT touched: this is
+// modeled on a real hardware reset button, which doesn't stop the
+// system clock. Callers that want a hard stop should call
+// SetRunning(false) explicitly before or after.
 func (p *Provider) Reset() {
-	p.running = false
 	p.accum = 0
 	p.stepsDone = 0
 	p.Backend.Reset()

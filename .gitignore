@@ -1,3 +1,10 @@
 /bin/
 *.prof
 .DS_Store
+
+# wasm build artifacts — rebuilt by `make wasm` locally and by the
+# deploy pipeline. Source-of-truth is cmd/6502-wasm/*.go and web/{index.html, sim.js}.
+/web/sim.wasm
+/web/wasm_exec.js
+
+.claude/

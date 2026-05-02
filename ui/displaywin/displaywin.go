@@ -43,6 +43,8 @@ type buttonDef struct {
 
 // All labels padded to 12 chars so the "< … >" brackets line up.
 var buttonDefs = []buttonDef{
+	{"Text Mode   ", display.RegMode, display.ModeChar},
+	{"Graphics    ", display.RegMode, display.ModeGraphics},
 	{"Frame Sync  ", display.RegFrame, 0x01},
 	{"Clear       ", display.RegCmd, display.CmdClear},
 	{"Invert      ", display.RegCmd, display.CmdInvert},
@@ -84,6 +86,37 @@ type Provider struct {
 	Width         int
 	Height        int
 	CellsPerPixel int
+
+	// Graphics is an optional pixel plane. When set AND the controller
+	// reports graphics mode (RegMode == ModeGraphics), the framebuffer
+	// area of the window switches its rendering. Leave nil to disable
+	// graphics mode entirely.
+	Graphics *display.GraphicsPlane
+
+	// Window, if set, has its Title rewritten each Draw to reflect
+	// the current display mode — so the VIC's own chrome shows
+	// "[TEXT]" or "[GFX]" without needing a separate status indicator.
+	// The base title is captured on first Draw; subsequent updates
+	// only swap the trailing tag.
+	Window    *foxpro.Window
+	baseTitle string
+
+	// RenderBlockArt selects the graphics-mode rendering strategy:
+	//
+	//   - false (default): framebuffer cells are stamped with a
+	//     pixel-placeholder sentinel rune. Hosts that can substitute
+	//     pixel data per-cell (the wasm bridge) see the sentinel and
+	//     overlay actual pixels there. Terminal hosts will render
+	//     the sentinel as a missing-glyph "tofu" — set this flag to
+	//     true to get block-art instead.
+	//
+	//   - true: framebuffer cells are filled with upper-half-block
+	//     (▀) glyphs whose fg/bg encode two stacked pixels. Loses
+	//     half the vertical resolution but renders cleanly in any
+	//     terminal that supports 24-bit color.
+	//
+	// The flag has no effect when not in graphics mode.
+	RenderBlockArt bool
 
 	// MemRangeStart / MemRangeEnd bound the bottom hex strip's
 	// scroll range (both inclusive). When unset (both zero), the
@@ -211,6 +244,20 @@ func (p *Provider) fireButton(idx int) {
 }
 
 func (p *Provider) Draw(screen tcell.Screen, inner foxpro.Rect, theme foxpro.Theme, focused bool) {
+	// Rewrite the window's title to advertise the current display
+	// mode. Captured once on first Draw so reset/runtime title
+	// changes from outside flow through.
+	if p.Window != nil {
+		if p.baseTitle == "" {
+			p.baseTitle = stripModeTag(p.Window.Title)
+		}
+		tag := "TEXT"
+		if p.graphicsActive() {
+			tag = "GFX"
+		}
+		p.Window.Title = p.baseTitle + "  [" + tag + "]"
+	}
+
 	c := foxpro.NewCanvas(screen, inner, &p.ScrollState)
 	chrome := chromeStyle(theme)
 	frame := chrome
@@ -227,9 +274,29 @@ func (p *Provider) Draw(screen tcell.Screen, inner foxpro.Rect, theme foxpro.The
 	}
 	c.Set(1+pxW, 0, '┐', frame)
 
+	gfxMode := p.graphicsActive()
+
 	for py := 0; py < pxH; py++ {
 		ly := 1 + py
 		c.Set(0, ly, '│', frame)
+		if gfxMode {
+			// Tag each framebuffer cell with the pixel-placeholder rune
+			// (Unicode Private-Use-Area U+E000). The wasm bridge
+			// passes this through to JS untouched; JS detects the
+			// codepoint and substitutes pixel data from the graphics
+			// plane there. Cells overwritten by other windows or by
+			// drop shadows lose the sentinel and render normally —
+			// the substitution honors foxpro's z-order for free.
+			//
+			// Terminal hosts can't substitute pixels per-cell, so the
+			// drawGraphicsBlockArt pass below overwrites these cells
+			// with block-art glyphs before the frame ships.
+			for k := 0; k < pxW; k++ {
+				c.Set(1+k, ly, pixelPlaceholderRune, bg)
+			}
+			c.Set(1+pxW, ly, '│', frame)
+			continue
+		}
 		for px := 0; px < p.Width; px++ {
 			off := py*p.Width + px
 			var color uint8
@@ -262,6 +329,15 @@ func (p *Provider) Draw(screen tcell.Screen, inner foxpro.Rect, theme foxpro.The
 			}
 		}
 		c.Set(1+pxW, ly, '│', frame)
+	}
+
+	// Block-art fallback (opt-in via RenderBlockArt) — terminal hosts
+	// that can't do per-cell pixel substitution overwrite the sentinel
+	// cells with upper-half-block glyphs encoding two stacked pixels.
+	// Browser hosts must NOT enter this branch: the substitution path
+	// relies on the sentinels staying intact in the cell snapshot.
+	if gfxMode && p.Graphics != nil && p.RenderBlockArt {
+		drawGraphicsBlockArt(c, p.Graphics, 1, 1, pxW, pxH)
 	}
 
 	by := 1 + pxH

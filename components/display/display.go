@@ -3,7 +3,11 @@
 // through a 16-color palette.
 package display
 
-import "time"
+import (
+	"time"
+
+	"github.com/carledwards/6502-sim-tui/asm"
+)
 
 // Display is a width × height byte grid mapped onto a contiguous
 // region of the bus. Reads / Writes through the bus interface
@@ -64,13 +68,21 @@ func (d *Display) Bytes() []uint8 { return d.bytes }
 //	    CmdRect* command. Whole-display commands (Clear, ShiftUp,
 //	    Invert, etc.) ignore them. Coords are clamped to the display.
 const (
-	RegCmd   uint16 = 0
-	RegPause uint16 = 1
-	RegFrame uint16 = 2
-	RegRectX uint16 = 3
-	RegRectY uint16 = 4
-	RegRectW uint16 = 5
-	RegRectH uint16 = 6
+	RegCmd      uint16 = 0
+	RegPause    uint16 = 1
+	RegFrame    uint16 = 2
+	RegRectX    uint16 = 3
+	RegRectY    uint16 = 4
+	RegRectW    uint16 = 5
+	RegRectH    uint16 = 6
+	RegGfxColor uint16 = 7 // current draw color for CmdGfx* (palette index 0–15)
+	RegMode     uint16 = 8 // display mode: 0 = char (default), 1 = graphics
+)
+
+// Display modes for RegMode.
+const (
+	ModeChar     uint8 = 0
+	ModeGraphics uint8 = 1
 )
 
 // Command opcodes recognised by the command register at +0.
@@ -98,6 +110,28 @@ const (
 	CmdRectRotDown    uint8 = 0x10 // wrap-around vertical rotate down within rect
 	CmdRectRotLeft    uint8 = 0x11 // wrap-around horizontal rotate left within rect
 	CmdRectRotRight   uint8 = 0x12 // wrap-around horizontal rotate right within rect
+
+	// Graphics-mode commands — only effective when the controller is
+	// bound to a GraphicsPlane (NewControllerWithGraphics, or by
+	// assigning Controller.Graphics). All use the current GfxColor
+	// register as the draw color. Coords come from RegRectX/Y/W/H,
+	// reinterpreted per command:
+	//
+	//   CmdGfxClear     — fill plane with GfxColor (no coords)
+	//   CmdGfxPlot      — pixel at (RectX, RectY)
+	//   CmdGfxLine      — line from (RectX, RectY) to (RectW, RectH)
+	//                     (RectW/H reinterpreted as the second endpoint X/Y)
+	//   CmdGfxRectFill  — fill rect (RectX, RectY, RectW, RectH)
+	//   CmdGfxRectStroke— outline rect
+	//   CmdGfxCircle    — outline circle, centre (RectX, RectY), radius RectW
+	//   CmdGfxFillCircle— filled circle
+	CmdGfxClear      uint8 = 0x20
+	CmdGfxPlot       uint8 = 0x21
+	CmdGfxLine       uint8 = 0x22
+	CmdGfxRectFill   uint8 = 0x23
+	CmdGfxRectStroke uint8 = 0x24
+	CmdGfxCircle     uint8 = 0x25
+	CmdGfxFillCircle uint8 = 0x26
 )
 
 // Controller is a memory-mapped command register that drives a
@@ -119,22 +153,61 @@ type Controller struct {
 	paused    bool
 	snapColor []uint8
 	snapChar  []uint8
+	snapGfx   []uint8 // graphics-plane snapshot, populated only when Graphics != nil
 
 	// Rect parameters consumed by CmdRect* commands. Updated on
 	// writes to RegRectX/Y/W/H; persist across commands so a CPU
 	// targeting the same rect repeatedly only re-sets the cmd byte.
 	rectX, rectY, rectW, rectH uint8
+
+	// Graphics — optional; nil means graphics commands are no-ops.
+	// Wired via NewControllerWithGraphics or direct assignment.
+	Graphics *GraphicsPlane
+	gfxColor uint8 // current draw color for CmdGfx* commands
+	mode     uint8 // ModeChar or ModeGraphics; readable by renderers
 }
 
 // NewController binds the controller to a display pair. The two
-// displays must have matching Width/Height.
+// displays must have matching Width/Height. Graphics mode is not
+// enabled — see NewControllerWithGraphics.
 func NewController(name string, base uint16, color, chars *Display) *Controller {
 	return &Controller{name: name, base: base, color: color, chars: chars}
 }
 
+// NewControllerWithGraphics binds the controller to a display pair
+// AND a graphics plane. CmdGfx* commands (Clear, Plot, Line, Rect*,
+// Circle*) become operative; the GfxColor register selects the
+// current draw color.
+func NewControllerWithGraphics(name string, base uint16, color, chars *Display, gfx *GraphicsPlane) *Controller {
+	return &Controller{name: name, base: base, color: color, chars: chars, Graphics: gfx}
+}
+
 func (c *Controller) Name() string { return c.name }
 func (c *Controller) Base() uint16 { return c.base }
-func (c *Controller) Size() int    { return 7 }
+func (c *Controller) Size() int    { return 9 }
+
+// Symbols implements bus.Labeller — returns the controller's
+// register layout so memory views can show labels for the VIC
+// register block.
+func (c *Controller) Symbols() []asm.Symbol {
+	b := c.base
+	return []asm.Symbol{
+		{Name: "VIC_CMD", Addr: b + RegCmd, Size: 1, Note: "command register (write to fire op)"},
+		{Name: "VIC_PAUSE", Addr: b + RegPause, Size: 1, Note: "0=live, 1=show snapshot"},
+		{Name: "VIC_FRAME", Addr: b + RegFrame, Size: 1, Note: "any write captures snapshot"},
+		{Name: "VIC_RECT_X", Addr: b + RegRectX, Size: 1, Note: "rect/draw X"},
+		{Name: "VIC_RECT_Y", Addr: b + RegRectY, Size: 1, Note: "rect/draw Y"},
+		{Name: "VIC_RECT_W", Addr: b + RegRectW, Size: 1, Note: "rect/draw width or radius"},
+		{Name: "VIC_RECT_H", Addr: b + RegRectH, Size: 1, Note: "rect/draw height"},
+		{Name: "VIC_GFX_COLOR", Addr: b + RegGfxColor, Size: 1, Note: "current draw color (palette idx)"},
+		{Name: "VIC_MODE", Addr: b + RegMode, Size: 1, Note: "0=char, 1=graphics"},
+	}
+}
+
+// Mode returns the current display mode (ModeChar or ModeGraphics).
+// Renderers use this to decide whether to draw the character grid or
+// the graphics plane.
+func (c *Controller) Mode() uint8 { return c.mode }
 
 func (c *Controller) Read(offset uint16) uint8 {
 	switch offset {
@@ -155,6 +228,10 @@ func (c *Controller) Read(offset uint16) uint8 {
 		return c.rectW
 	case RegRectH:
 		return c.rectH
+	case RegGfxColor:
+		return c.gfxColor
+	case RegMode:
+		return c.mode
 	}
 	return 0
 }
@@ -184,6 +261,10 @@ func (c *Controller) Write(offset uint16, v uint8) {
 		c.rectW = v
 	case RegRectH:
 		c.rectH = v
+	case RegGfxColor:
+		c.gfxColor = v
+	case RegMode:
+		c.mode = v
 	}
 }
 
@@ -288,6 +369,38 @@ func (c *Controller) execute(cmd uint8) {
 		copy(chb[w:], chb[:(h-1)*w])
 		copy(cb[:w], saveC)
 		copy(chb[:w], saveH)
+
+	// Graphics-mode commands. Skipped silently when no graphics plane
+	// is attached so terminal builds without a graphics window can
+	// still receive the same demo bytecode without crashing.
+	case CmdGfxClear:
+		if c.Graphics != nil {
+			c.Graphics.Clear(c.gfxColor)
+		}
+	case CmdGfxPlot:
+		if c.Graphics != nil {
+			c.Graphics.SetPixel(int(c.rectX), int(c.rectY), c.gfxColor)
+		}
+	case CmdGfxLine:
+		if c.Graphics != nil {
+			c.Graphics.Line(int(c.rectX), int(c.rectY), int(c.rectW), int(c.rectH), c.gfxColor)
+		}
+	case CmdGfxRectFill:
+		if c.Graphics != nil {
+			c.Graphics.FillRect(int(c.rectX), int(c.rectY), int(c.rectW), int(c.rectH), c.gfxColor)
+		}
+	case CmdGfxRectStroke:
+		if c.Graphics != nil {
+			c.Graphics.StrokeRect(int(c.rectX), int(c.rectY), int(c.rectW), int(c.rectH), c.gfxColor)
+		}
+	case CmdGfxCircle:
+		if c.Graphics != nil {
+			c.Graphics.Circle(int(c.rectX), int(c.rectY), int(c.rectW), c.gfxColor)
+		}
+	case CmdGfxFillCircle:
+		if c.Graphics != nil {
+			c.Graphics.FillCircle(int(c.rectX), int(c.rectY), int(c.rectW), c.gfxColor)
+		}
 	}
 }
 
@@ -300,6 +413,13 @@ func (c *Controller) captureSnapshot() {
 	}
 	copy(c.snapColor, cb)
 	copy(c.snapChar, chb)
+	if c.Graphics != nil {
+		gb := c.Graphics.Bytes()
+		if len(c.snapGfx) != len(gb) {
+			c.snapGfx = make([]uint8, len(gb))
+		}
+		copy(c.snapGfx, gb)
+	}
 }
 
 // IsPaused reports whether display reads return snapshot bytes.
@@ -324,6 +444,32 @@ func (c *Controller) ReadColor(off int) uint8 {
 		return c.snapColor[off]
 	}
 	return c.color.Bytes()[off]
+}
+
+// ReadGfxPixel returns the palette index of the graphics-plane pixel
+// at (x, y), honoring pause state — when paused, the snapshot bytes
+// are decoded; otherwise the live plane is sampled. Returns 0 if no
+// graphics plane is attached or coords are out of bounds.
+func (c *Controller) ReadGfxPixel(x, y int) uint8 {
+	if c.Graphics == nil {
+		return 0
+	}
+	g := c.Graphics
+	if x < 0 || y < 0 || x >= g.Width() || y >= g.Height() {
+		return 0
+	}
+	if !c.paused || len(c.snapGfx) == 0 {
+		return g.GetPixel(x, y)
+	}
+	bitOffset := x * g.BPP()
+	off := y*g.Stride() + bitOffset/8
+	if off >= len(c.snapGfx) {
+		return 0
+	}
+	bitWithin := bitOffset % 8
+	shift := 8 - g.BPP() - bitWithin
+	mask := byte((1 << g.BPP()) - 1)
+	return (c.snapGfx[off] >> shift) & mask
 }
 
 // ReadChar returns the char byte at the linear offset, honoring

@@ -12,14 +12,16 @@ import (
 
 	foxpro "github.com/carledwards/foxpro-go"
 	"github.com/carledwards/6502-sim-tui/bus"
+	"github.com/carledwards/6502-sim-tui/asm"
 	"github.com/carledwards/6502-sim-tui/cpu"
 	"github.com/carledwards/6502-sim-tui/disasm"
 )
 
-// View modes the Memory window can display.
+// View modes the Memory window can display. Cycle with 'v'.
 const (
 	ViewHex    = 0
 	ViewDisasm = 1
+	ViewLabels = 2
 )
 
 const bytesPerRow = 16
@@ -66,11 +68,28 @@ type Provider struct {
 	// current view + visible range.
 	Window *foxpro.Window
 
-	// View selects between ViewHex and ViewDisasm. Toggle with 'v'.
+	// View selects between ViewHex / ViewDisasm / ViewLabels. Cycle with 'v'.
 	View int
 
 	// ShowInfo enables the disasm-mode side panel. Toggle with 'i'.
 	ShowInfo bool
+
+	// Symbols, if non-empty, drives:
+	//
+	//   - The Labels view (ViewLabels): a sortable list of named
+	//     memory regions with current values pulled live from the bus.
+	//   - The Disasm view: operand addresses that match a known
+	//     symbol render as the symbol name (e.g. "LDA TICK_LO" instead
+	//     of "LDA $00").
+	//
+	// Updated by main.go's loadDemo callback so each demo gets its own
+	// labels surfaced.
+	Symbols []asm.Symbol
+
+	// Annotations, if non-empty, augments the Disasm view with a
+	// per-instruction comment column at the right edge — the same
+	// human comments the demo author attached via asm.Comment(...).
+	Annotations []asm.Annotation
 
 	foxpro.ScrollState
 
@@ -147,8 +166,12 @@ func (p *Provider) Draw(screen tcell.Screen, inner foxpro.Rect, theme foxpro.The
 		hAddr, hOK = p.Highlight()
 	}
 
-	if p.View == ViewDisasm {
+	switch p.View {
+	case ViewDisasm:
 		p.drawDisasm(c, bg, pcStyle, editStyle, hAddr, hOK)
+		return
+	case ViewLabels:
+		p.drawLabels(c, theme, bg)
 		return
 	}
 	p.drawHex(c, theme, bg, pcStyle, editStyle, hAddr, hOK)
@@ -163,8 +186,12 @@ func (p *Provider) drawHex(c *foxpro.Canvas, theme foxpro.Theme, bg, pcStyle, ed
 	//   Yellow  → write that changed the byte (most interesting)
 	//   Brown   → write that left the byte unchanged (touched but no-op)
 	//   Green   → read
+	//
+	// Yellow is bright (CGA #FFFF55) — the inherited white fg from
+	// `bg` is unreadable on top of it, so we force black fg there.
+	// Brown and Green are dark enough that white fg keeps contrast.
 	readStyle := bg.Background(theme.Palette.Green)
-	writeChStyle := bg.Background(theme.Palette.Yellow)
+	writeChStyle := bg.Background(theme.Palette.Yellow).Foreground(theme.Palette.Black)
 	writeNcStyle := bg.Background(theme.Palette.Brown)
 	const traceFreshness = 20 // ~1 second at 20 fps
 
@@ -304,7 +331,8 @@ func (p *Provider) drawDisasm(c *foxpro.Canvas, bg, pcStyle, editStyle tcell.Sty
 		}
 		c.Put(7, ly, "  ", rowStyle)
 		c.Put(9, ly, disasm.HexBytes(ins.Bytes), rowStyle)
-		c.Put(19, ly, "  "+ins.Pretty, rowStyle)
+		// Pretty + symbol-substituted operand + per-instruction comment.
+		c.Put(19, ly, "  "+p.annotateInstrText(ins.Addr, ins.Pretty), rowStyle)
 
 		// Save the PC-marked instruction so we can render the info
 		// panel after the loop (needs live registers + bus reads).
@@ -491,10 +519,20 @@ func (p *Provider) HandleKey(ev *tcell.EventKey) bool {
 	if ev.Key() == tcell.KeyRune {
 		switch ev.Rune() {
 		case 'v', 'V':
-			if p.View == ViewDisasm {
-				p.View = ViewHex
-			} else {
+			// Cycle Hex → Disasm → Labels → Hex. Skip Labels when
+			// the provider has no symbols loaded — shows an empty
+			// list which is confusing.
+			switch p.View {
+			case ViewHex:
 				p.View = ViewDisasm
+			case ViewDisasm:
+				if len(p.Symbols) > 0 {
+					p.View = ViewLabels
+				} else {
+					p.View = ViewHex
+				}
+			default: // ViewLabels (or unknown)
+				p.View = ViewHex
 			}
 			p.SetScrollOffset(0, 0)
 			return true
