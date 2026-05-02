@@ -37,7 +37,33 @@ make run
 
 Esc or Ctrl+Q to quit.
 
-### CLI flags
+## Browser build
+
+Same code, same demos, same dual-CPU backend — running in the browser
+via WebAssembly through [`foxpro-go/wasm`](https://github.com/carledwards/foxpro-go).
+The simulator's `tcell.Screen` is swapped for a `tcell.SimulationScreen`
+(pure-Go cell buffer) and the JS side renders the cells to a canvas.
+
+```bash
+make wasm           # build web/sim.wasm + copy wasm_exec.js
+make wasm-serve     # python3 -m http.server on port 8765 (override with PORT=)
+```
+
+Then open `http://localhost:8765/`.
+
+The wasm build defaults to:
+
+- **interp** CPU (netsim is slow under wasm; swap via the CPU menu if
+  you want to watch transistors crawl)
+- auto-start running so visitors see motion immediately
+- Esc / Ctrl+Q disabled (would terminate the wasm runtime and brick
+  the page); close the tab instead
+
+Bundle size: ~4.9 MB raw, ~1.4 MB gzipped. Standard static-host MIME
+config (`application/wasm`) is enough — no cross-origin headers
+required.
+
+### CLI flags (terminal build only)
 
 | Flag           | Default   | Notes                                                 |
 |----------------|-----------|-------------------------------------------------------|
@@ -47,6 +73,10 @@ Esc or Ctrl+Q to quit.
 | `-batch`       | `500`     | Max half-cycles per UI tick — raise for `interp`     |
 | `-cpuprofile`  | (off)     | Write CPU pprof to file                              |
 | `-memprofile`  | (off)     | Write heap pprof at exit                             |
+
+The wasm build doesn't take flags; it boots with sensible defaults
+(see Browser build above). User-facing controls live in the menus and
+keyboard shortcuts.
 
 ## Memory map
 
@@ -135,7 +165,7 @@ snapshots.
 | `.`       | Stop                                |
 | `S`       | Step one instruction (until PC changes) |
 | `T`       | Step one half-cycle ("tick")        |
-| `Esc`     | Quit                                |
+| `Esc`     | Quit (terminal) · close menu (browser, where Quit is disabled) |
 
 In the Memory window:
 
@@ -169,7 +199,9 @@ contracts. `docs/roadmap.md` tracks remaining work.
 ## Project layout
 
 ```
-cmd/6502-sim/        application entry, main wiring, demo programs
+cmd/6502-sim/        terminal entry — main wiring, flags, profiling
+cmd/6502-wasm/       browser entry — wasm-tagged, uses foxpro-go's wasm bridge
+internal/demos/      shared demo programs + tiny 6502 assembler for Quad
 bus/                 Bus interface, Component, TraceBus (read/write generation tracking)
 cpu/                 Backend interface
 cpu/netsim/          netsim adapter
@@ -177,6 +209,7 @@ cpu/interp/          interpretive 151-opcode 6502
 components/          ram, rom, display, clock, ttybuf, keyboard
 disasm/              151-opcode disassembler with cycle counts and effects
 ui/                  cpuwin, ramwin, displaywin, clockwin, etc.
+web/                 static frontend served by the wasm build (built artifacts)
 docs/                architecture, roadmap
 ```
 
@@ -186,7 +219,7 @@ Working. The transistor-level core hits ~26 kHz on a recent Mac;
 the interpretive core is several MHz. Both pass the same demos.
 
 Bus, disassembler, Backend interface, and the embedded assembler
-(`cmd/6502-sim/quaddemo.go`) are eventual candidates for promotion
+(`internal/demos/quad.go`) are eventual candidates for promotion
 into the base `6502-netsim-go` repo as a "6502 system kit" — see
 notes at the bottom of `docs/architecture.md`.
 

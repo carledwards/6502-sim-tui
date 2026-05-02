@@ -1,15 +1,28 @@
+//go:build js && wasm
+
+// 6502-wasm is the browser port of the 6502 simulator.
+//
+// Same widgets, same demos, same dual-CPU backend (interp + netsim) as
+// cmd/6502-sim — only the host changes. Foxpro-go's wasm bridge does
+// the heavy lifting (SimulationScreen → JS canvas, browser keys/mouse
+// → tcell events), so this file is mostly the same wiring as the TUI
+// main, with terminal-only bits stripped (flag parsing, profiling).
+//
+// Defaults differ from the terminal build because they're host-tuned:
+//
+//   - CPU: interp (netsim is slow in wasm; user can swap via menu)
+//   - Auto-start running: yes (browser visitors expect motion)
+//   - QuitKeys: cleared (Esc/Ctrl+Q would kill the wasm runtime)
+//   - BackgroundDragChords: shift+click only (right-click = native menu)
 package main
 
 import (
-	"flag"
 	"fmt"
-	"log"
-	"os"
-	"runtime"
-	"runtime/pprof"
 	"time"
 
 	foxpro "github.com/carledwards/foxpro-go"
+	"github.com/carledwards/foxpro-go/wasm"
+	"github.com/gdamore/tcell/v2"
 
 	"github.com/carledwards/6502-sim-tui/bus"
 	"github.com/carledwards/6502-sim-tui/components/display"
@@ -23,20 +36,9 @@ import (
 	"github.com/carledwards/6502-sim-tui/ui/cpuwin"
 	"github.com/carledwards/6502-sim-tui/ui/displaywin"
 	"github.com/carledwards/6502-sim-tui/ui/ramwin"
-
-	"github.com/gdamore/tcell/v2"
 )
 
-// Memory map. Modeled after a real 6502 machine: contiguous RAM in
-// the bottom half, I/O up high, ROM at the top. The 8 KB RAM is one
-// flat block — programs can use $0000-$00FF (zero page), $0100-$01FF
-// (stack), and the rest as ordinary working memory.
-//
-// VIC bases are laid out so that each is a uniform +$8000 offset
-// from the equivalent in older builds. That keeps demo addresses
-// translatable by changing just the high nibble of the high byte
-// ($02 → $82, $05 → $85, $08 → $88), and matches the C64-style
-// "I/O lives high" convention.
+// Memory map. Mirrors cmd/6502-sim — no host-specific changes.
 const (
 	ramBase   = 0x0000
 	ramSize   = 0x2000 // 8 KB at $0000-$1FFF
@@ -49,25 +51,11 @@ const (
 	romSize   = 0x2000
 )
 
-// Memory map a demo author should know:
-//   $0000-$1FFF  RAM (8 KB)
-//   $8000+       VIC color plane  (40 × 13 = 520 bytes)
-//   $8500+       VIC char plane   (520 bytes)
-//   $8800-$8802  VIC controller   (cmd / pause / frame)
-//   $E000-$FFFF  ROM (program loaded here, reset vector at $FFFC)
-
-
-// tuneCandidates are the batch sizes auto-tune tries in order. They
-// are already round numbers, so the picked value is also "memorable"
-// — no separate rounding step needed.
+// tuneCandidates and autoTune mirror cmd/6502-sim. Browser tick
+// budgets are slightly tighter, but the same auto-tune loop applies —
+// it just lands on a smaller batch number.
 var tuneCandidates = []int{500, 1000, 1500, 2000, 2500, 3000, 4000, 5000, 7500, 10000, 20000, 50000, 100000}
 
-// autoTune runs increasing-size batches against the backend and
-// returns the largest size that fit inside `budget`. Conservative
-// by design: budget < tickPeriod leaves UI headroom.
-//
-// Mutates backend state (advances cycles); the caller should Reset
-// the CPU after.
 func autoTune(backend cpu.Backend, budget time.Duration) int {
 	best := tuneCandidates[0]
 	for _, n := range tuneCandidates {
@@ -80,7 +68,7 @@ func autoTune(backend cpu.Backend, budget time.Duration) int {
 			best = n
 			continue
 		}
-		break // batches will only get slower; stop
+		break
 	}
 	return best
 }
@@ -88,45 +76,8 @@ func autoTune(backend cpu.Backend, budget time.Duration) int {
 const tickPeriod = 50 * time.Millisecond
 
 func main() {
-	cpuFlag := flag.String("cpu", "netsim", "CPU backend: netsim or interp")
-	runFlag := flag.Bool("run", false, "start the clock running immediately")
-	speedFlag := flag.String("speed", "", "starting clock speed: 1, 10, 100, 1k (or 1000), max")
-	batchFlag := flag.Int("batch", 0, "max HalfSteps per UI tick (0 = default 500). Raise for interp; lower if UI is janky.")
-	cpuProfile := flag.String("cpuprofile", "", "write CPU profile to file (active for the lifetime of the process)")
-	memProfile := flag.String("memprofile", "", "write heap profile to file at exit")
-	flag.Parse()
-
-	if *cpuProfile != "" {
-		f, err := os.Create(*cpuProfile)
-		if err != nil {
-			log.Fatalf("cpuprofile create: %v", err)
-		}
-		defer f.Close()
-		if err := pprof.StartCPUProfile(f); err != nil {
-			log.Fatalf("cpuprofile start: %v", err)
-		}
-		defer pprof.StopCPUProfile()
-	}
-	if *memProfile != "" {
-		defer func() {
-			f, err := os.Create(*memProfile)
-			if err != nil {
-				log.Printf("memprofile create: %v", err)
-				return
-			}
-			defer f.Close()
-			runtime.GC()
-			if err := pprof.WriteHeapProfile(f); err != nil {
-				log.Printf("memprofile write: %v", err)
-			}
-		}()
-	}
-
-	// Bus + memory map. The outer TraceBus stamps each read/write with
-	// a generation counter so the memory viewer can tint cells that
-	// have been touched recently. The inner bus is what the memory
-	// viewer's display reads use, so its own polling doesn't pollute
-	// the trace.
+	// Bus + memory map. Outer TraceBus stamps reads/writes for the
+	// memory viewer's "recently touched" tinting.
 	innerBus := bus.New()
 	b := bus.NewTraceBus(innerBus)
 	mainRAM := ram.New("ram", ramBase, ramSize)
@@ -134,9 +85,6 @@ func main() {
 	charPlane := display.New("display.char", charBase, dispW, dispH)
 	mainROM := rom.New("rom", romBase, romSize)
 
-	// paintInitialDisplay seeds the framebuffer with a diagonal-gradient
-	// background so there's something to see before any program runs.
-	// Also called when switching demos to give a clean canvas.
 	paintInitialDisplay := func() {
 		for y := 0; y < dispH; y++ {
 			for x := 0; x < dispW; x++ {
@@ -157,7 +105,6 @@ func main() {
 	must(b.Register(dispCtrl))
 	must(b.Register(mainROM))
 
-	// CPU backend — mutable so the CPU menu can swap it at runtime.
 	buildBackend := func(name string) (cpu.Backend, error) {
 		switch name {
 		case "netsim":
@@ -168,30 +115,34 @@ func main() {
 		return nil, fmt.Errorf("unknown cpu %q (want netsim or interp)", name)
 	}
 
-	backend, err := buildBackend(*cpuFlag)
+	currentCPU := "interp" // wasm default; interp is fast enough to be lively
+	backend, err := buildBackend(currentCPU)
 	if err != nil {
-		fmt.Fprintln(os.Stderr, err)
-		os.Exit(2)
+		panic(err)
 	}
 	backend.Reset()
-	currentCPU := *cpuFlag
 	cpuTitle := fmt.Sprintf("CPU (%s)", currentCPU)
 
-	// foxpro-go app.
-	app, err := foxpro.NewApp()
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "init:", err)
-		os.Exit(1)
+	// SimulationScreen sized to fit every window plus menu+status rows.
+	// 140×32 covers the widest layout (display window ends at col 136).
+	s := tcell.NewSimulationScreen("UTF-8")
+	if err := s.Init(); err != nil {
+		panic(err)
 	}
-	defer app.Close()
+	s.SetSize(140, 32)
+	s.EnableMouse()
 
-	// Opt in to foxpro's standard CLEAR / HELP / QUIT / VER command-window
-	// commands. As of foxpro-go's switch to opt-in builtins, this call
-	// is required to keep the F2 command window populated.
-	foxpro.RegisterBuiltinCommands(app)
+	app := foxpro.NewAppWithScreen(s)
+
+	// Browser-appropriate settings.
+	app.Settings.QuitKeys = nil
+	app.Settings.BackgroundDragChords = []foxpro.BackgroundDragChord{
+		{Button: tcell.Button1, Mods: tcell.ModShift},
+	}
+	app.Settings.StatusBarLeft = " Esc to close "
 
 	// Track every window we create so we can toggle visibility from
-	// a Window menu after the user closes one.
+	// the Window menu after a close.
 	var windows []*foxpro.Window
 	addWindow := func(title string, bounds foxpro.Rect, content foxpro.ContentProvider, minW, minH int) *foxpro.Window {
 		w := foxpro.NewWindow(title, bounds, content)
@@ -213,7 +164,7 @@ func main() {
 		cpuwin.MinW, cpuwin.MinH)
 
 	ramProv := &ramwin.Provider{
-		Bus:          innerBus, // read display state without tracing it
+		Bus:          innerBus,
 		Trace:        b,
 		Backend:      backend,
 		Base:         0x0000,
@@ -244,15 +195,11 @@ func main() {
 	romProv.Window = romWin
 
 	clockProv := clockwin.NewProvider(backend)
-	clockProv.MaxBatch = *batchFlag
 	addWindow("Clock",
 		foxpro.Rect{X: 2, Y: 13, W: 38, H: 7},
 		clockProv,
 		clockwin.MinW, clockwin.MinH)
 
-	// machineReset = full simulated-machine restart: stop clock, drop
-	// VIC pause, clear RAM, repaint display, reset CPU. ROM stays
-	// loaded with the current demo so reset starts that demo over.
 	machineReset := func() {
 		clockProv.SetRunning(false)
 		b.Write(ctrlBase+display.RegPause, 0)
@@ -262,51 +209,34 @@ func main() {
 	}
 	cpuProv.OnReset = machineReset
 
-
 	dispProv := &displaywin.Provider{
-		// inner bus so the window's own hex-dump reads don't pollute
-		// the read-trace. Component dispatch is identical — every
-		// component is registered on the inner bus via TraceBus's
-		// delegating Register, and button POKEs to $8800 still hit
-		// the controller normally; they just aren't shown in the
-		// per-cell trace tinting.
-		Bus:        innerBus,
-		Controller: dispCtrl,
-		ColorBase:  colorBase,
-		CharBase:   charBase,
-		CtrlBase:   ctrlBase,
-		HasChars:   true,
-		HasCtrl:    true,
-		Width:      dispW,
-		Height:     dispH,
-
-		// Hex strip can only scroll across the VIC's own memory:
-		// color plane through the last controller register.
+		Bus:           innerBus,
+		Controller:    dispCtrl,
+		ColorBase:     colorBase,
+		CharBase:      charBase,
+		CtrlBase:      ctrlBase,
+		HasChars:      true,
+		HasCtrl:       true,
+		Width:         dispW,
+		Height:        dispH,
 		MemRangeStart: colorBase,
 		MemRangeEnd:   ctrlBase + 6,
 	}
-	// Layout: display + button column on top, hex-dump half-box below.
-	// Half-box adds left │ + scrollbar on right and top/bottom rules:
-	//   1 (│) + labelW (7) + hex (48) + gap (2) + ascii (16) + 1 (▲)
-	//   = 75 cols inner → outer 77.
-	// Heights: 17 (display incl. frames) + box top (1) + header (1)
-	//   + 7 data + box bottom (1) = 27 inner → outer 29.
 	dispTitle := fmt.Sprintf("VIC $%04X-$%04X", colorBase, ctrlBase+6)
 	addWindow(dispTitle,
 		foxpro.Rect{X: 60, Y: 1, W: 77, H: 29},
 		dispProv,
 		displaywin.MinW, displaywin.MinH)
 
-	// Run loop. App.Tick fires on the UI thread, so simulator
+	// Run loop. App.Tick fires on the UI goroutine, so simulator
 	// advancement, register reads, and bus reads all serialize
 	// naturally — no locks needed.
 	app.Tick(tickPeriod, func() {
 		clockProv.Advance(tickPeriod)
-		b.Tick() // age the read/write trace
+		b.Tick()
 	})
 
-	// Global key bindings. Active in any focused window so the user
-	// can drive the simulator without first focusing the Clock window.
+	// Global key bindings — same set as the TUI.
 	app.OnKey = func(ev *tcell.EventKey) bool {
 		if ev.Key() != tcell.KeyRune {
 			return false
@@ -337,25 +267,17 @@ func main() {
 		return false
 	}
 
-	// loadDemo swaps in a different ROM payload and resets the CPU.
-	// Also pokes CmdResume into the display controller so a previous
-	// framed demo's pause state doesn't leak into a live demo.
 	loadDemo := func(d demos.Demo) {
 		clockProv.SetRunning(false)
-		// Resume the VIC so a previous framed demo's pause state
-		// doesn't leak into a live demo.
 		b.Write(ctrlBase+display.RegPause, 0)
 		mainROM.Clear()
 		_ = mainROM.Load(0, d.Bytes)
 		_ = mainROM.SetResetVector(0xE000)
 		paintInitialDisplay()
 		clockProv.Reset()
+		clockProv.SetRunning(true)
 	}
 
-	// switchCPU swaps the CPU backend at runtime. The bus stays the
-	// same — RAM, display, and ROM contents are preserved across the
-	// switch — so the freshly-Reset CPU starts from $E000 against the
-	// existing memory map.
 	switchCPU := func(name string) {
 		if name == currentCPU {
 			return
@@ -389,11 +311,6 @@ func main() {
 		}
 	}
 
-	// Window menu — toggle visibility for each window we created.
-	// Closing a window via the ■ glyph removes it from the manager
-	// but keeps the *foxpro.Window alive (we hold a reference here),
-	// so toggling adds the same instance back with its scroll
-	// position and other state intact.
 	windowItems := make([]foxpro.MenuItem, 0, len(windows))
 	for _, w := range windows {
 		w := w
@@ -415,8 +332,6 @@ func main() {
 			Items: []foxpro.MenuItem{
 				{Label: "&Reset Machine", Hotkey: "Z", OnSelect: machineReset},
 				{Label: "&Command Window", Hotkey: "F2", OnSelect: app.ToggleCommandWindow},
-				{Separator: true},
-				{Label: "E&xit", Hotkey: "Esc", OnSelect: app.Quit},
 			},
 		},
 		{
@@ -436,7 +351,6 @@ func main() {
 				{Separator: true},
 				{Label: "Auto-&tune Batch", OnSelect: func() {
 					clockProv.SetRunning(false)
-					// Budget: 70% of the 50ms tick for UI headroom.
 					best := autoTune(backend, 35*time.Millisecond)
 					clockProv.MaxBatch = best
 					clockProv.Reset()
@@ -453,8 +367,6 @@ func main() {
 		},
 	})
 
-	// Live tray — top-right of the menu bar. Compute fns run every
-	// frame, so the rate updates as the sim runs.
 	app.MenuBar.Tray = []foxpro.TrayItem{
 		{Compute: func() string {
 			if clockProv.Running() {
@@ -470,35 +382,12 @@ func main() {
 		}},
 	}
 
-	if *speedFlag != "" {
-		hz := -1
-		switch *speedFlag {
-		case "1":
-			hz = 1
-		case "10":
-			hz = 10
-		case "100":
-			hz = 100
-		case "1k", "1000":
-			hz = 1000
-		case "max", "0":
-			hz = 0
-		}
-		if hz < 0 || !clockProv.SetSpeedHz(hz) {
-			fmt.Fprintf(os.Stderr, "unknown -speed=%q (want 1, 10, 100, 1k, max)\n", *speedFlag)
-			os.Exit(2)
-		}
-	}
-
-	if *runFlag {
-		clockProv.SetRunning(true)
-	}
-
-	app.Run()
+	clockProv.SetRunning(true) // browser visitors expect motion right away
+	wasm.Run(app, s)
 }
 
 func must(err error) {
 	if err != nil {
-		log.Fatalf("setup: %v", err)
+		panic(err)
 	}
 }

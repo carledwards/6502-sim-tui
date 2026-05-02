@@ -1,4 +1,4 @@
-package main
+package demos
 
 // Quadrant scroll demo — divides the framebuffer into 4 rectangular
 // regions and rotates each independently in a different cardinal
@@ -15,8 +15,8 @@ package main
 // and fires a CmdRectRot{Up,Right,Down,Left} at $8800. Pause + Frame
 // commit each iteration as one snapshot.
 
-// quadProg is built at init time by assembling the listing below.
-var quadProg = buildQuadProg()
+// Quad is built at init time by assembling the listing below.
+var Quad = buildQuad()
 
 // ----- Tiny 6502 assembler (just enough for this demo) -----
 //
@@ -47,7 +47,10 @@ func (a *asm) pc() int               { return a.base + len(a.code) }
 func (a *asm) emit(b ...byte)        { a.code = append(a.code, b...) }
 func (a *asm) label(name string)     { a.labels[name] = a.pc() }
 func (a *asm) addrFix(target string) { a.fixes = append(a.fixes, asmFix{pos: len(a.code), target: target}); a.emit(0, 0) }
-func (a *asm) relFix(target string)  { a.fixes = append(a.fixes, asmFix{pos: len(a.code), target: target, rel: true, relPC: a.pc() + 1}); a.emit(0) }
+func (a *asm) relFix(target string) {
+	a.fixes = append(a.fixes, asmFix{pos: len(a.code), target: target, rel: true, relPC: a.pc() + 1})
+	a.emit(0)
+}
 
 // Instruction emitters.
 func (a *asm) lda_imm(v byte)       { a.emit(0xA9, v) }
@@ -85,7 +88,7 @@ func (a *asm) build() []byte {
 
 // ----- Demo program -----
 
-func buildQuadProg() []byte {
+func buildQuad() []byte {
 	a := newAsm(0xE000)
 
 	// Controller register addresses.
@@ -129,10 +132,10 @@ func buildQuadProg() []byte {
 
 	// === LOOP — issue four rect rotations, then frame-commit ===
 	a.label("LOOP")
-	fireRect(0, 0, 20, 6, cmdRectRotUp)    // TL
+	fireRect(0, 0, 20, 6, cmdRectRotUp)     // TL
 	fireRect(20, 0, 20, 6, cmdRectRotRight) // TR
-	fireRect(0, 7, 20, 6, cmdRectRotDown)  // BL
-	fireRect(20, 7, 20, 6, cmdRectRotLeft) // BR
+	fireRect(0, 7, 20, 6, cmdRectRotDown)   // BL
+	fireRect(20, 7, 20, 6, cmdRectRotLeft)  // BR
 	a.lda_imm(0x01)
 	a.sta_abs(regFrame)
 	a.jmp("LOOP")
