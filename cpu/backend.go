@@ -55,4 +55,15 @@ type Backend interface {
 	// interpretive core doesn't model interrupt inputs.
 	IRQ() bool
 	NMI() bool
+
+	// SYNC reports the SYNC pin state — true on the half-cycle
+	// where the CPU is fetching an opcode (T1 cycle). Used by
+	// observers (logic analyzer, debugger) as a backend-agnostic
+	// "instruction boundary" marker, since both backends report
+	// it at the same point regardless of how they internally
+	// represent execution. For interp this is synthesized: true
+	// on the half-step that runs the next instruction's logic,
+	// false during the burn ticks that make up the rest of the
+	// cycle count.
+	SYNC() bool
 }

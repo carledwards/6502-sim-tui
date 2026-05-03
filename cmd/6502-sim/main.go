@@ -312,12 +312,12 @@ func main() {
 		scopewin.MinW, scopewin.MinH)
 	app.Manager.Remove(scopeWin)
 
-	var lastPC uint16
+	prevSync := false
 	clockProv.OnHalfStep = func() {
-		pc := backend.Registers().PC
-		instrEdge := pc != lastPC
-		lastPC = pc
-		scopeProv.Capture(backend.AddressBus(), backend.DataBus(), instrEdge)
+		s := backend.SYNC()
+		edge := s && !prevSync
+		prevSync = s
+		scopeProv.Capture(backend.AddressBus(), backend.DataBus(), edge)
 	}
 
 	// machineReset = full simulated-machine restart: drop VIC pause,

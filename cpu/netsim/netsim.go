@@ -59,6 +59,7 @@ func (a *Adapter) DataBus() uint8     { return a.cpu.DataBus() }
 func (a *Adapter) ReadCycle() bool    { return a.cpu.IsReadCycle() }
 func (a *Adapter) IRQ() bool          { return a.cpu.IRQ() }
 func (a *Adapter) NMI() bool          { return a.cpu.NMI() }
+func (a *Adapter) SYNC() bool         { return a.cpu.SYNC() }
 
 // Compile-time check that Adapter satisfies cpu.Backend.
 var _ cpu.Backend = (*Adapter)(nil)

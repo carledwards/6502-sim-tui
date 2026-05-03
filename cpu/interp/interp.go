@@ -46,6 +46,12 @@ type Adapter struct {
 	lastAddr    uint16
 	lastData    uint8
 	lastWasRead bool
+
+	// sync mirrors a real 6502's SYNC pin: true on the half-step
+	// where the next instruction's logic is actually executed
+	// (analogous to T1 / opcode fetch), false on the burn ticks
+	// that pad out the instruction's published cycle count.
+	sync bool
 }
 
 // New creates an Adapter wired to the given bus. Call Reset before
@@ -59,13 +65,20 @@ func (a *Adapter) Reset() {
 	a.pc = a.read16(0xFFFC)
 	a.halfCyclesLeft = 7*2 - 1 // reset takes 7 cycles
 	a.halfCyclesTotal = 0
+	a.sync = false
 }
 
 func (a *Adapter) HalfStep() {
 	if a.halfCyclesLeft > 0 {
 		a.halfCyclesLeft--
+		a.sync = false
 	} else {
 		a.execute()
+		// Mirror a real 6502's SYNC line going high during opcode
+		// fetch (T1). Interp executes the whole instruction in one
+		// call, so SYNC is true on the half-step that ran execute()
+		// and false on the burn ticks that follow.
+		a.sync = true
 	}
 	a.halfCyclesTotal++
 }
@@ -81,8 +94,9 @@ func (a *Adapter) DataBus() uint8     { return a.lastData }
 func (a *Adapter) ReadCycle() bool    { return a.lastWasRead }
 
 // interp doesn't model interrupt inputs — they're always inactive.
-func (a *Adapter) IRQ() bool { return true }
-func (a *Adapter) NMI() bool { return true }
+func (a *Adapter) IRQ() bool  { return true }
+func (a *Adapter) NMI() bool  { return true }
+func (a *Adapter) SYNC() bool { return a.sync }
 
 var _ cpu.Backend = (*Adapter)(nil)
 

@@ -302,15 +302,18 @@ func main() {
 
 	// Capture per-half-step bus state. Cheap closure, fired from
 	// inside clockProv's HalfStep paths (Advance/Step*).
-	// Track PC across half-steps so we can mark each capture with
-	// "did the instruction just complete?" The CLK row in the scope
-	// uses this to color instruction-boundary pulses brightly.
-	var lastPC uint16
+	// Yellow CLK pulses fire on the RISING EDGE of SYNC — i.e. the
+	// half-step where opcode fetch begins. Edge-detect rather than
+	// level-detect because netsim holds SYNC high for the full T1
+	// cycle (2 half-steps) while interp synthesizes a 1-half-step
+	// pulse. Edge-detection gives exactly one yellow per
+	// instruction on both backends, with matching spacing.
+	prevSync := false
 	clockProv.OnHalfStep = func() {
-		pc := backend.Registers().PC
-		instrEdge := pc != lastPC
-		lastPC = pc
-		scopeProv.Capture(backend.AddressBus(), backend.DataBus(), instrEdge)
+		s := backend.SYNC()
+		edge := s && !prevSync
+		prevSync = s
+		scopeProv.Capture(backend.AddressBus(), backend.DataBus(), edge)
 	}
 
 	// machineReset = simulated hardware reset button. Drops the VIC

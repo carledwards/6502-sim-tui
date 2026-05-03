@@ -1,5 +1,5 @@
-github.com/carledwards/6502-netsim-go v0.1.0 h1:Ki/FfLi3AArQcc++YRqEEEOt4et9SXqGDg+CCN44cYM=
-github.com/carledwards/6502-netsim-go v0.1.0/go.mod h1:k/L4UinTvGB5KikGh+LZCIClnXjtn7oLBDyhPct66+4=
+github.com/carledwards/6502-netsim-go v0.1.1 h1:w74VIGmOqhugL5SuTD3hR+NmAF21zMukaoo59UUhkGY=
+github.com/carledwards/6502-netsim-go v0.1.1/go.mod h1:k/L4UinTvGB5KikGh+LZCIClnXjtn7oLBDyhPct66+4=
 github.com/carledwards/foxpro-go v0.1.2 h1:1wKYun++c+wKYj+B8s9ROxVgfslW33fuTxnlVED6aKA=
 github.com/carledwards/foxpro-go v0.1.2/go.mod h1:IcnDgILGxAuK0AMz6BBeXYLpmo4Np30v3jiogJOMoCI=
 github.com/gdamore/encoding v1.0.0 h1:+7OoQ1Bc6eTm5niUzBa0Ctsh6JbMW6Ra+YNuAtDBdko=
