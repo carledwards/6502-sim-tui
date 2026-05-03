@@ -25,6 +25,7 @@ import (
 	"github.com/carledwards/6502-sim-tui/ui/cpuwin"
 	"github.com/carledwards/6502-sim-tui/ui/displaywin"
 	"github.com/carledwards/6502-sim-tui/ui/ramwin"
+	"github.com/carledwards/6502-sim-tui/ui/scopewin"
 	"github.com/carledwards/6502-sim-tui/ui/viawin"
 
 	"github.com/gdamore/tcell/v2"
@@ -299,6 +300,26 @@ func main() {
 		viaProv,
 		viawin.MinW, viawin.MinH)
 
+	// Logic-analyzer scope: 256 cycles of trace history. Hidden by
+	// default — toggled via the Window menu. In TUI mode the canvas
+	// region is blank (no graphics overlay); the cell-rendered
+	// label strip is still useful as a placeholder.
+	// TUI has no graphics layer; cell-mode (one sample per cell).
+	scopeProv := scopewin.New(128, false)
+	scopeWin := addWindow("Logic Analyzer",
+		foxpro.Rect{X: 1, Y: 1, W: 139, H: 30},
+		scopeProv,
+		scopewin.MinW, scopewin.MinH)
+	app.Manager.Remove(scopeWin)
+
+	var lastPC uint16
+	clockProv.OnHalfStep = func() {
+		pc := backend.Registers().PC
+		instrEdge := pc != lastPC
+		lastPC = pc
+		scopeProv.Capture(backend.AddressBus(), backend.DataBus(), instrEdge)
+	}
+
 	// machineReset = full simulated-machine restart: drop VIC pause,
 	// clear RAM, reset peripherals, repaint display, reset CPU. ROM
 	// stays loaded with the current demo so reset starts it over.
@@ -311,6 +332,7 @@ func main() {
 		b.Write(ctrlBase+display.RegPause, 0)
 		mainRAM.Reset()
 		via1.Reset()
+		scopeProv.Reset()
 		paintInitialDisplay()
 		clockProv.Reset()
 	}
@@ -366,7 +388,29 @@ func main() {
 	// observing the VIA timer underflow that's about to come.
 	const subTicks = 10
 	subPeriod := tickPeriod / subTicks
+
+	// Auto-tune the scope's sampling stride to the current CPU
+	// speed. At low Hz we capture every half-cycle (100%); at
+	// higher rates we decimate so the visible trace covers a
+	// useful time window instead of overwriting itself in
+	// microseconds.
+	scopeDecimate := func() int {
+		hz := clockProv.Speed().Hz
+		switch {
+		case hz == 0: // Max
+			return 256
+		case hz >= 100000:
+			return 32
+		case hz >= 10000:
+			return 8
+		case hz >= 1000:
+			return 4
+		}
+		return 1
+	}
+
 	app.Tick(tickPeriod, func() {
+		scopeProv.Decimate = scopeDecimate()
 		for i := 0; i < subTicks; i++ {
 			clockProv.Advance(subPeriod)
 			b.Tick(subPeriod)
@@ -414,6 +458,7 @@ func main() {
 		// doesn't leak into a live demo.
 		b.Write(ctrlBase+display.RegPause, 0)
 		via1.Reset()
+		scopeProv.Reset()
 		mainROM.Clear()
 		_ = mainROM.Load(0, d.Bytes)
 		_ = mainROM.SetResetVector(0xE000)
@@ -538,8 +583,14 @@ func main() {
 			Items: demoItems,
 		},
 		{
-			Label: "&Window",
+			Label: "&View",
 			Items: windowItems,
+		},
+		{
+			Label: "&Window",
+			Items: []foxpro.MenuItem{
+				{Label: "&Next", Hotkey: "F6", OnSelect: app.Manager.FocusNext},
+			},
 		},
 	})
 

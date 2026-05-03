@@ -49,10 +49,29 @@ type Provider struct {
 	// if the UI feels janky in Max mode.
 	MaxBatch int
 
+	// OnHalfStep, if non-nil, fires after every Backend.HalfStep()
+	// call regardless of which path triggered it (Advance, StepOne,
+	// StepInstruction). Use it to feed a per-cycle observer such as
+	// the scope window's bus-trace ring buffer. Kept hot — the
+	// closure is invoked once per CPU half-cycle, so the
+	// implementation should be cheap.
+	OnHalfStep func()
+
 	speedIdx  int
 	running   bool
 	accum     float64 // fractional half-cycles owed
 	stepsDone uint64
+}
+
+// halfStep advances the backend by one half-cycle and fires the
+// optional OnHalfStep hook. All internal callers (Advance / StepOne
+// / StepInstruction) route through here so observers see every
+// step regardless of trigger source.
+func (p *Provider) halfStep() {
+	p.Backend.HalfStep()
+	if p.OnHalfStep != nil {
+		p.OnHalfStep()
+	}
 }
 
 // NewProvider returns a Provider with a sensible default speed
@@ -96,7 +115,7 @@ func (p *Provider) Advance(elapsed time.Duration) {
 			n = 1
 		}
 		for i := 0; i < n; i++ {
-			p.Backend.HalfStep()
+			p.halfStep()
 		}
 		p.stepsDone += uint64(n)
 		return
@@ -108,7 +127,7 @@ func (p *Provider) Advance(elapsed time.Duration) {
 		n = cap
 	}
 	for i := 0; i < n; i++ {
-		p.Backend.HalfStep()
+		p.halfStep()
 	}
 	p.stepsDone += uint64(n)
 }
@@ -118,7 +137,7 @@ func (p *Provider) StepOne() {
 	if p.running {
 		return
 	}
-	p.Backend.HalfStep()
+	p.halfStep()
 	p.stepsDone++
 }
 
@@ -135,7 +154,7 @@ func (p *Provider) StepInstruction() {
 	}
 	start := p.Backend.Registers().PC
 	for i := 0; i < maxStepHalves; i++ {
-		p.Backend.HalfStep()
+		p.halfStep()
 		p.stepsDone++
 		if p.Backend.Registers().PC != start {
 			return

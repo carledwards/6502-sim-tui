@@ -25,21 +25,20 @@ to real silicon unmodified.
 
 ## Quickstart
 
-This repo expects two sibling checkouts:
-
-```
-6502-sim-tui/    <-- this repo
-foxpro-go/       <-- TUI framework
-6502-netsim-go/  <-- transistor-level CPU
-```
-
-`go.mod` has `replace` directives pointing at the siblings during
-development.
-
 ```bash
 make tidy
 make run
 ```
+
+`go.mod` pins
+[`foxpro-go`](https://github.com/carledwards/foxpro-go) (TUI framework)
+and [`6502-netsim-go`](https://github.com/carledwards/6502-netsim-go)
+(transistor-level CPU) to tagged versions, so a clean clone fetches
+everything from the module proxy with no sibling-checkout setup.
+
+If you want to iterate on either dependency locally, add a temporary
+`replace` directive in `go.mod` pointing at your sibling checkout —
+remove it before pushing.
 
 Defaults are tuned for "open it, see something happening": the TUI
 boots on the interpretive CPU at Max speed with batch auto-tuned to

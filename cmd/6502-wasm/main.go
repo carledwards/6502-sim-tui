@@ -38,6 +38,7 @@ import (
 	"github.com/carledwards/6502-sim-tui/ui/cpuwin"
 	"github.com/carledwards/6502-sim-tui/ui/displaywin"
 	"github.com/carledwards/6502-sim-tui/ui/ramwin"
+	"github.com/carledwards/6502-sim-tui/ui/scopewin"
 	"github.com/carledwards/6502-sim-tui/ui/viawin"
 )
 
@@ -283,6 +284,35 @@ func main() {
 		viaProv,
 		viawin.MinW, viawin.MinH)
 
+	// Logic-analyzer scope: 256 cycles of trace history. Hidden by
+	// default — shown when the user enables it from the Window menu.
+	// 128 cells of canvas = 128 visible samples. The run loop
+	// auto-tunes Decimate based on the current CPU speed (see
+	// scopeDecimate below) so the visible time window stays
+	// useful across the full speed range without sacrificing
+	// per-cycle resolution at low speeds.
+	// 128 cells of canvas. WASM: graphics-mode pixel overlay,
+	// 8 samples per cell → 1024 visible samples at high density.
+	scopeProv := scopewin.New(128, true)
+	scopeWin := addWindow("Logic Analyzer",
+		foxpro.Rect{X: 1, Y: 1, W: 139, H: 30},
+		scopeProv,
+		scopewin.MinW, scopewin.MinH)
+	app.Manager.Remove(scopeWin) // start hidden; toggle adds it back
+
+	// Capture per-half-step bus state. Cheap closure, fired from
+	// inside clockProv's HalfStep paths (Advance/Step*).
+	// Track PC across half-steps so we can mark each capture with
+	// "did the instruction just complete?" The CLK row in the scope
+	// uses this to color instruction-boundary pulses brightly.
+	var lastPC uint16
+	clockProv.OnHalfStep = func() {
+		pc := backend.Registers().PC
+		instrEdge := pc != lastPC
+		lastPC = pc
+		scopeProv.Capture(backend.AddressBus(), backend.DataBus(), instrEdge)
+	}
+
 	// machineReset = simulated hardware reset button. Drops the VIC
 	// pause/mode, clears RAM and graphics, resets the VIA, repaints
 	// the display init pattern, then resets the CPU. The clock is
@@ -295,6 +325,7 @@ func main() {
 		gfxPlane.Clear(0)
 		mainRAM.Reset()
 		via1.Reset()
+		scopeProv.Reset()
 		paintInitialDisplay()
 		clockProv.Reset()
 	}
@@ -344,7 +375,30 @@ func main() {
 	// crystal runs continuously.
 	const subTicks = 10
 	subPeriod := tickPeriod / subTicks
+
+	// Pick a scope sampling stride that matches the current CPU
+	// speed. At low Hz the buffer fills slowly enough that we
+	// can capture every half-cycle (100% sampling); at very high
+	// rates the buffer would otherwise overwrite faster than the
+	// eye can track. Tiers chosen to keep ~1024 visible
+	// half-cycles regardless of speed.
+	scopeDecimate := func() int {
+		hz := clockProv.Speed().Hz
+		switch {
+		case hz == 0: // Max
+			return 256
+		case hz >= 100000:
+			return 32
+		case hz >= 10000:
+			return 8
+		case hz >= 1000:
+			return 4
+		}
+		return 1
+	}
+
 	app.Tick(tickPeriod, func() {
+		scopeProv.Decimate = scopeDecimate()
 		for i := 0; i < subTicks; i++ {
 			clockProv.Advance(subPeriod)
 			b.Tick(subPeriod)
@@ -388,6 +442,7 @@ func main() {
 		b.Write(ctrlBase+display.RegMode, display.ModeChar)
 		gfxPlane.Clear(0)
 		via1.Reset()
+		scopeProv.Reset()
 		mainROM.Clear()
 		_ = mainROM.Load(0, d.Bytes)
 		_ = mainROM.SetResetVector(0xE000)
@@ -488,8 +543,14 @@ func main() {
 			Items: demoItems,
 		},
 		{
-			Label: "&Window",
+			Label: "&View",
 			Items: windowItems,
+		},
+		{
+			Label: "&Window",
+			Items: []foxpro.MenuItem{
+				{Label: "&Next", Hotkey: "F6", OnSelect: app.Manager.FocusNext},
+			},
 		},
 	})
 
