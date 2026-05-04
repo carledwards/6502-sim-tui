@@ -171,17 +171,20 @@ func buildBouncingBalls() asm.Program {
 
 	// Program VIA Timer 1 for ~50 ms pacing.
 	// Latch = 50_000 = $C350, at 1 MHz VIA crystal → 50 ms period.
-	// Order matters: write latch low first, THEN T1C-H — the high
-	// write transfers latch→counter and starts T1.
-	a.Comment("VIA T1 latch low: $50 (50_000 = $C350 → 50 ms @ 1 MHz)").
-		LdaImm(0x50).
-		StaAbs(ViaT1L_L)
-	a.Comment("VIA T1 latch high — also starts T1").
-		LdaImm(0xC3).
-		StaAbs(ViaT1C_H)
+	// Order matters: ACR=$40 (free-run) goes BEFORE T1C_H so T1
+	// arms straight into free-run mode. If ACR is set after, a
+	// wall-clock VIA can underflow in the gap and self-disarm via
+	// one-shot semantics. Then T1L_L, then T1C_H (the high write
+	// transfers latch→counter and starts T1).
 	a.Comment("ACR bit 6 = T1 free-run mode (auto-reload on underflow)").
 		LdaImm(ViaT1Bit).
 		StaAbs(ViaACR)
+	a.Comment("VIA T1 latch low: $50 (50_000 = $C350 → 50 ms @ 1 MHz)").
+		LdaImm(0x50).
+		StaAbs(ViaT1L_L)
+	a.Comment("VIA T1 latch high — arms T1 in free-run mode").
+		LdaImm(0xC3).
+		StaAbs(ViaT1C_H)
 
 	// Initialise four balls. Positions chosen to avoid initial overlap;
 	// velocities a mix of ±1 in each axis; colors picked to look good

@@ -23,16 +23,20 @@ func buildMarquee() asm.Program {
 		StaAbs(RegCmd)
 
 	// Program VIA T1 for free-running pacing.
+	// Order matters: write ACR=$40 (free-run) BEFORE T1C_H so T1
+	// arms directly into free-run mode. If we set ACR after T1C_H,
+	// a wall-clock VIA can underflow in the gap and self-disarm
+	// (one-shot semantics) before the program switches modes.
 	// Latch = $FFFF → ~65 ms period at 1 MHz → ~15 scrolls / sec.
-	a.Comment("VIA T1 latch low: $FF").
-		LdaImm(0xFF).
-		StaAbs(ViaT1L_L)
-	a.Comment("VIA T1 latch high: $FF — also starts T1 (max period)").
-		LdaImm(0xFF).
-		StaAbs(ViaT1C_H)
 	a.Comment("ACR bit 6 = T1 free-run (auto-reload from latch)").
 		LdaImm(ViaT1Bit).
 		StaAbs(ViaACR)
+	a.Comment("VIA T1 latch low: $FF").
+		LdaImm(0xFF).
+		StaAbs(ViaT1L_L)
+	a.Comment("VIA T1 latch high: $FF — arms T1 in free-run mode").
+		LdaImm(0xFF).
+		StaAbs(ViaT1C_H)
 
 	a.Comment("loop counter for message copy").
 		LdxImm(0)

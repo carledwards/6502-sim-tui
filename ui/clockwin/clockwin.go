@@ -25,6 +25,9 @@ var Speeds = []Speed{
 	{"10Hz", 10},
 	{"100Hz", 100},
 	{"1kHz", 1000},
+	{"10kHz", 10000},
+	{"100kHz", 100000},
+	{"1MHz", 1000000},
 	{"Max", 0},
 }
 
@@ -96,9 +99,16 @@ func NewProvider(backend cpu.Backend) *Provider {
 const referenceTick = 50 * time.Millisecond
 
 // Advance is called by the run loop on a fixed cadence.
-func (p *Provider) Advance(elapsed time.Duration) {
+// Advance executes HalfSteps for the given wall-clock window and
+// returns how many it actually ran. Callers driving peripherals from
+// the same loop should use the return value (× 500 ns at 1 MHz
+// nominal) for those peripherals' Tick budget so the bus stays in
+// lockstep with the CPU clock — see cmd/6502-{sim,wasm}/main.go.
+// Returns 0 when the clock is paused or speed gates the next step
+// out of this window.
+func (p *Provider) Advance(elapsed time.Duration) int {
 	if !p.running {
-		return
+		return 0
 	}
 	cap := p.MaxBatch
 	if cap <= 0 {
@@ -118,7 +128,7 @@ func (p *Provider) Advance(elapsed time.Duration) {
 			p.halfStep()
 		}
 		p.stepsDone += uint64(n)
-		return
+		return n
 	}
 	p.accum += float64(hz*2) * elapsed.Seconds()
 	n := int(p.accum)
@@ -130,6 +140,7 @@ func (p *Provider) Advance(elapsed time.Duration) {
 		p.halfStep()
 	}
 	p.stepsDone += uint64(n)
+	return n
 }
 
 // StepOne advances exactly one half-cycle. Wired to the [T]ick UI.

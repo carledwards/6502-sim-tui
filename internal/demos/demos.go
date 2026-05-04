@@ -94,6 +94,10 @@ const (
 // directly accessible on the Demo value.
 type Demo struct {
 	Name string
+	// Description is a short multi-line teaching blurb shown in
+	// the demo picker dialog. Each entry is one display line.
+	// Optional — omit for demos that don't ship via the picker.
+	Description []string
 	// RequiresGraphics is true for demos that switch the VIC into
 	// graphics mode and rely on the high-resolution pixel plane.
 	// Hosts without a graphics plane (the terminal build) should
@@ -113,14 +117,79 @@ type Section struct {
 // references these directly for the boot demo (so its Symbols /
 // Annotations land on the memory views from frame zero).
 var (
-	MarqueeDemo        = Demo{Name: "&Marquee (default)", Program: buildMarquee()}
-	BouncerDemo        = Demo{Name: "&Bouncer", Program: buildBouncer()}
-	ScrollerDemo       = Demo{Name: "&Scroller", Program: buildScroller()}
-	SnowDemo           = Demo{Name: "S&now (LFSR)", Program: buildSnow()}
-	ScrollerFramedDemo = Demo{Name: "Scroller (&framed)", Program: buildScrollerFramed()}
-	BlitterDemo        = Demo{Name: "&Blitter (RAM→VIC)", Program: buildBlitter()}
-	QuadDemo           = Demo{Name: "&Quadrants (4 scrolls)", Program: buildQuad()}
-	BouncingBallsDemo  = Demo{Name: "&Bouncing Balls (graphics mode)", RequiresGraphics: true, Program: buildBouncingBalls()}
+	MarqueeDemo = Demo{
+		Name: "&Marquee (default)",
+		Description: []string{
+			"A scrolling text banner across the top row.",
+			"Demonstrates VIA T1 free-run pacing and a",
+			"polling loop that reads the IFR.",
+		},
+		Program: buildMarquee(),
+	}
+	BouncerDemo = Demo{
+		Name: "&Bouncer",
+		Description: []string{
+			"A character bounces around the text grid.",
+			"Velocity flips on edge collisions; pacing",
+			"comes from VIA T1 underflow events.",
+		},
+		Program: buildBouncer(),
+	}
+	ScrollerDemo = Demo{
+		Name: "&Scroller",
+		Description: []string{
+			"Horizontal pixel-resolution text scroll using",
+			"the VIC fine-scroll register. Same VIA pacing",
+			"as Marquee but smooth instead of stepped.",
+		},
+		Program: buildScroller(),
+	}
+	SnowDemo = Demo{
+		Name: "S&now (LFSR)",
+		Description: []string{
+			"Hardware-style entropy: an LFSR drives one",
+			"random pixel per tick into the char plane.",
+			"Stable pattern after enough cycles.",
+		},
+		Program: buildSnow(),
+	}
+	ScrollerFramedDemo = Demo{
+		Name: "Scroller (&framed)",
+		Description: []string{
+			"Like Scroller, but with a static border drawn",
+			"in the color plane. Shows independent layers:",
+			"foreground scrolling, background fixed.",
+		},
+		Program: buildScrollerFramed(),
+	}
+	BlitterDemo = Demo{
+		Name: "&Blitter (RAM→VIC)",
+		Description: []string{
+			"Copies a buffer from RAM to the VIC each frame.",
+			"Demonstrates the bus throughput needed for",
+			"frame-by-frame updates.",
+		},
+		Program: buildBlitter(),
+	}
+	QuadDemo = Demo{
+		Name: "&Quadrants (4 scrolls)",
+		Description: []string{
+			"Four independent text scrollers, one per",
+			"quadrant of the screen. Stresses the scroll",
+			"register and the interleaved update logic.",
+		},
+		Program: buildQuad(),
+	}
+	BouncingBallsDemo = Demo{
+		Name: "&Bouncing Balls (graphics mode)",
+		Description: []string{
+			"Switches the VIC into 160x100 graphics mode.",
+			"Four colored balls bounce off the edges.",
+			"Hidden in the terminal build (no pixel plane).",
+		},
+		RequiresGraphics: true,
+		Program:          buildBouncingBalls(),
+	}
 )
 
 // Compatibility byte slices. Older callers loaded these directly

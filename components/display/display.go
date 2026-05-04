@@ -186,6 +186,25 @@ func (c *Controller) Name() string { return c.name }
 func (c *Controller) Base() uint16 { return c.base }
 func (c *Controller) Size() int    { return 9 }
 
+// Reset returns the controller to the post-power-on state: live
+// (not paused), char mode, no snapshot, rect params zero, draw
+// color zero, last-cmd state cleared. Pixel buffers (color / char
+// / graphics) are NOT cleared here — callers reset those at their
+// own granularity (e.g. host's machineReset clears RAM, repaints
+// the display init pattern, then calls Reset on us).
+func (c *Controller) Reset() {
+	c.lastCmd = 0
+	c.lastCmdAt = time.Time{}
+	c.frameAt = time.Time{}
+	c.paused = false
+	c.snapColor = nil
+	c.snapChar = nil
+	c.snapGfx = nil
+	c.rectX, c.rectY, c.rectW, c.rectH = 0, 0, 0, 0
+	c.gfxColor = 0
+	c.mode = ModeChar
+}
+
 // Symbols implements bus.Labeller — returns the controller's
 // register layout so memory views can show labels for the VIC
 // register block.

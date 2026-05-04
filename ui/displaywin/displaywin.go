@@ -1,11 +1,10 @@
 // Package displaywin renders the VIC framebuffer with a single-line
-// blue-on-cyan border, a vertical strip of command buttons on the
-// right, and a small memory-map summary below. Button clicks POKE
-// the controller via the bus — same path the CPU uses.
+// blue-on-cyan border and a vertical strip of command buttons on
+// the right. Button clicks POKE the controller via the bus — same
+// path the CPU uses.
 package displaywin
 
 import (
-	"fmt"
 	"time"
 
 	"github.com/gdamore/tcell/v2"
@@ -35,40 +34,74 @@ func chromeStyle(theme foxpro.Theme) tcell.Style {
 // buttonDef describes one of the right-column command buttons. Each
 // fires a single bus.Write to the controller's address+reg with the
 // configured value — the same operation the CPU performs.
+// buttonDef holds one row of the button grid. applicableInGfx is
+// false for buttons whose POKE targets a register that doesn't
+// apply in graphics mode (text-grid scroll/rotate, char-plane
+// invert) — those hide themselves there. Frame Sync and Clear
+// stay visible in both modes.
 type buttonDef struct {
-	label string // padded to fixed width for column alignment
-	reg   uint16 // controller register offset (0/1/2)
-	val   uint8  // value to write
+	label           string // padded to fixed width for column alignment
+	reg             uint16 // controller register offset (0/1/2)
+	val             uint8  // value to write
+	applicableInGfx bool
 }
 
-// All labels padded to 12 chars so the "< … >" brackets line up.
+// Labels are trimmed; Draw centers each one inside a fixed-width
+// field so the brackets line up and shorter labels (Clear, Invert)
+// don't hug the left edge.
 var buttonDefs = []buttonDef{
-	{"Text Mode   ", display.RegMode, display.ModeChar},
-	{"Graphics    ", display.RegMode, display.ModeGraphics},
-	{"Frame Sync  ", display.RegFrame, 0x01},
-	{"Clear       ", display.RegCmd, display.CmdClear},
-	{"Invert      ", display.RegCmd, display.CmdInvert},
-	{"Scroll Left ", display.RegCmd, display.CmdShiftLeft},
-	{"Scroll Right", display.RegCmd, display.CmdShiftRight},
-	{"Scroll Up   ", display.RegCmd, display.CmdShiftUp},
-	{"Scroll Down ", display.RegCmd, display.CmdShiftDown},
-	{"Rotate Left ", display.RegCmd, display.CmdRotLeft},
-	{"Rotate Right", display.RegCmd, display.CmdRotRight},
-	{"Rotate Up   ", display.RegCmd, display.CmdRotUp},
-	{"Rotate Down ", display.RegCmd, display.CmdRotDown},
+	{"Frame Sync", display.RegFrame, 0x01, true},
+	{"Clear", display.RegCmd, display.CmdClear, true},
+	{"Invert", display.RegCmd, display.CmdInvert, false},
+	{"Scroll Left", display.RegCmd, display.CmdShiftLeft, false},
+	{"Scroll Right", display.RegCmd, display.CmdShiftRight, false},
+	{"Scroll Up", display.RegCmd, display.CmdShiftUp, false},
+	{"Scroll Down", display.RegCmd, display.CmdShiftDown, false},
+	{"Rotate Left", display.RegCmd, display.CmdRotLeft, false},
+	{"Rotate Right", display.RegCmd, display.CmdRotRight, false},
+	{"Rotate Up", display.RegCmd, display.CmdRotUp, false},
+	{"Rotate Down", display.RegCmd, display.CmdRotDown, false},
 }
 
 const (
-	// Right column — where Status and the button stack render.
-	rightColX = 44
+	// buttonLabelW is the fixed width the label is centered into.
+	// Wide enough to hold "Scroll Right" / "Rotate Right" (12 chars)
+	// without truncation.
+	buttonLabelW = 12
 
-	// Each button row is one logical line: "○ < Label >".
-	buttonW = 18 // "○ < 12chars  >" → 1+1+1+1+12+1+1 = 18
+	// Each button is rendered as "○ < Label >" — indicator + space
+	// + bracket + space + 12-char centered label + space + bracket.
+	buttonW = 1 + 1 + 1 + 1 + buttonLabelW + 1 + 1 // = 18
 
 	// Indicator stays "filled" for this long after a fire so the
 	// user sees a brief acknowledgment.
 	flashDuration = 300 * time.Millisecond
 )
+
+// centerLabel pads s with leading and trailing spaces so the result
+// is exactly w cells wide, with s centered. Extra-odd remainder pads
+// the right (matches FoxPro's "left-bias" centering convention).
+// Assumes runeLen(s) <= w.
+func centerLabel(s string, w int) string {
+	n := runeLen(s)
+	if n >= w {
+		return s
+	}
+	left := (w - n) / 2
+	right := w - n - left
+	return spaces(left) + s + spaces(right)
+}
+
+func spaces(n int) string {
+	if n <= 0 {
+		return ""
+	}
+	b := make([]byte, n)
+	for i := range b {
+		b[i] = ' '
+	}
+	return string(b)
+}
 
 // Provider renders a memory-mapped framebuffer. ColorBase points at
 // the color plane (low nibble = fg, high nibble = bg). CharBase, if
@@ -118,14 +151,6 @@ type Provider struct {
 	// The flag has no effect when not in graphics mode.
 	RenderBlockArt bool
 
-	// MemRangeStart / MemRangeEnd bound the bottom hex strip's
-	// scroll range (both inclusive). When unset (both zero), the
-	// strip can scroll the full 64 KB address space; setting them
-	// confines the view to a slice of memory — typically the VIC's
-	// own region from ColorBase through the last controller register.
-	MemRangeStart uint16
-	MemRangeEnd   uint16
-
 	foxpro.ScrollState
 
 	// Button drag state. pressedIdx is the index in buttonDefs of
@@ -137,63 +162,16 @@ type Provider struct {
 	// Per-button "recently fired" timestamps for the indicator flash.
 	lastFire []time.Time
 
-	// memBase is the address of the first byte shown in the bottom
-	// hex-dump section. Lazy-initialised from ColorBase. Mouse wheel
-	// over the section and '[' / ']' / '{' / '}' nudge it.
-	memBase uint16
-	memInit bool
+	// modeRect captures the on-screen rect of the Mode picker box
+	// from the last Draw, in screen coords. HandleMouse uses it to
+	// detect click-to-open-popup. Refreshed every frame.
+	modeRect foxpro.Rect
 
-	// Thumb-drag state for the hex-strip scrollbar. Captured when a
-	// left-click lands on ◆; cleared on mouse release. Track top/bot
-	// snapshot lets motion handler do the math without re-deriving
-	// the box geometry.
-	memDragging   bool
-	memDragTrackT int
-	memDragTrackB int
-}
-
-// memSpan = bytes shown in the bottom hex-dump section.
-const memSpan = memDataRows * memBytesPerRow
-
-// memBounds returns the inclusive [min, max] range memBase may take.
-// max is end-of-range minus one full strip, so the last visible byte
-// stays inside the configured memory window.
-func (p *Provider) memBounds() (minBase, maxBase int) {
-	end := int(p.MemRangeEnd)
-	if p.MemRangeStart == 0 && end == 0 {
-		end = 0xFFFF // unset → full address space
-	}
-	minBase = int(p.MemRangeStart)
-	maxBase = end - memSpan + 1
-	if maxBase < minBase {
-		maxBase = minBase // range smaller than a full strip → pinned
-	}
-	return
-}
-
-func (p *Provider) curMemBase() uint16 {
-	if !p.memInit {
-		if p.MemRangeStart != 0 || p.MemRangeEnd != 0 {
-			p.memBase = p.MemRangeStart
-		} else {
-			p.memBase = p.ColorBase
-		}
-		p.memInit = true
-	}
-	return p.memBase
-}
-
-func (p *Provider) shiftMemBase(delta int) {
-	minBase, maxBase := p.memBounds()
-	base := int(p.curMemBase()) + delta
-	if base < minBase {
-		base = minBase
-	}
-	if base > maxBase {
-		base = maxBase
-	}
-	p.memBase = uint16(base)
-	p.memInit = true
+	// OnPickMode, when set, is called with a click on the Mode
+	// picker. The host opens its own popup (so displaywin doesn't
+	// take a hard dependency on dialog or on app.Manager). If nil,
+	// the click cycles Text↔Graphics directly via the controller.
+	OnPickMode func()
 }
 
 // cellsPerPixel returns the on-screen cell width of one logical
@@ -208,22 +186,66 @@ func (p *Provider) cellsPerPixel() int {
 	return 2
 }
 
-// buttonRect returns the (x, y, width) of button `idx` in canvas
-// logical coordinates. Single right-side column, one row per button,
-// starting two rows below Status.
-func (p *Provider) buttonRect(idx int) (x, y, w int) {
-	return rightColX, 2 + idx, buttonW
+// visibleButtonDefs returns the buttonDef indices that should render
+// in the current mode. Frame Sync and Clear (applicableInGfx=true)
+// always show; the rest only in text mode.
+func (p *Provider) visibleButtonDefs() []int {
+	gfx := p.graphicsActive()
+	out := make([]int, 0, len(buttonDefs))
+	for i, def := range buttonDefs {
+		if gfx && !def.applicableInGfx {
+			continue
+		}
+		out = append(out, i)
+	}
+	return out
 }
 
-// buttonHitIdx returns the button index at screen-space (mx, my),
-// or -1 if no button is hit. Translates through the canvas scroll.
+// buttonGridStartY returns the canvas-y of the button grid's first
+// row — one blank line below the display's bottom border.
+func (p *Provider) buttonGridStartY() int { return p.Height + 3 }
+
+// buttonGridCols returns how many button columns fit across the
+// inner width. Buttons are 18 cells wide with a 2-cell gap between
+// columns so the indicator '○' on the next button doesn't sit
+// directly against the '>' of the previous one.
+func buttonGridCols(innerW int) int {
+	const colW = buttonW + 2 // 18 + 2 gap
+	if innerW < buttonW {
+		return 1
+	}
+	n := (innerW + 2) / colW
+	if n < 1 {
+		n = 1
+	}
+	return n
+}
+
+// buttonRect returns the (x, y, width) of the visible button at
+// position `visIdx` in the grid. Visible buttons are laid out
+// left-to-right, top-to-bottom in a `cols`-wide grid starting at
+// buttonGridStartY().
+func (p *Provider) buttonRect(visIdx, cols int) (x, y, w int) {
+	if cols < 1 {
+		cols = 1
+	}
+	row := visIdx / cols
+	col := visIdx % cols
+	return col * (buttonW + 2), p.buttonGridStartY() + row, buttonW
+}
+
+// buttonHitIdx returns the buttonDefs index at screen-space (mx, my),
+// or -1 if no visible button is hit. Translates through the canvas
+// scroll and through the visible-only grid mapping.
 func (p *Provider) buttonHitIdx(mx, my int, inner foxpro.Rect) int {
 	lx := (mx - inner.X) + p.X
 	ly := (my - inner.Y) + p.Y
-	for i := range buttonDefs {
-		bx, by, bw := p.buttonRect(i)
+	visible := p.visibleButtonDefs()
+	cols := buttonGridCols(inner.W)
+	for vIdx, defIdx := range visible {
+		bx, by, bw := p.buttonRect(vIdx, cols)
 		if lx >= bx && lx < bx+bw && ly == by {
-			return i
+			return defIdx
 		}
 	}
 	return -1
@@ -347,171 +369,136 @@ func (p *Provider) Draw(screen tcell.Screen, inner foxpro.Rect, theme foxpro.The
 	}
 	c.Set(1+pxW, by, '┘', frame)
 
-	// ─── Right column: Status + button stack ────────────────
+	// ─── Right column: Status + Mode picker ────────────────
+	rcX := pxW + 4
 	if p.HasCtrl && p.Controller != nil {
 		paused := p.Controller.IsPaused()
-		status := "Running"
+		status := "Running    "
 		if paused {
-			status = "Paused "
+			// "Paused" reads as "stopped" to a user, but really
+			// the display has just cut over to the snapshot taken
+			// at Frame Sync — so the demo controls when frames
+			// commit. "Manual Sync" describes that mode honestly.
+			status = "Manual Sync"
 		}
-		c.Put(rightColX, 0, "Status: "+status, bg)
+		c.Put(rcX, 0, "Status: "+status, bg)
 
-		now := time.Now()
-		for i, def := range buttonDefs {
-			bxc, byc, _ := p.buttonRect(i)
+		// Mode field — boxed value the user clicks to open the
+		// Text / Graphics popup. FoxPro picker fields use a
+		// "shadow" border: single line on top + left, double line
+		// on bottom + right, mixed corner glyphs (┌──╖ / ╘══╝).
+		// That asymmetry reads as a 3D recessed surface, marking
+		// the cell as clickable.
+		//
+		// Label reflects Controller.Mode() directly, NOT
+		// graphicsActive(). The latter is gated on a Graphics plane
+		// being attached — true in wasm, false in the terminal
+		// build — so using it would freeze the label at "Text" in
+		// the sim even after the user selects Graphics.
+		// Width is sized to the longest possible label ("Graphics")
+		// + 1 cell of padding on each side. Shorter labels ("Text")
+		// get centered in the inner span so the box visually
+		// "holds" the value rather than left-hugging it.
+		const modeMaxLabelLen = 8 // "Graphics"
+		modeLabel := "Text"
+		if p.Controller.Mode() == display.ModeGraphics {
+			modeLabel = "Graphics"
+		}
+		modeBoxX := rcX + 12 // after "Video Mode: "
+		modeBoxY := 2
+		modeBoxW := modeMaxLabelLen + 4 // 2 borders + 2 padding + label
+		modeInnerW := modeBoxW - 2
+		labelLen := runeLen(modeLabel)
+		labelPadL := (modeInnerW - labelLen) / 2
+		c.Put(rcX, modeBoxY+1, "Video Mode: ", bg)
+		// Top edge ─, right edge ║, bottom edge ═, left edge │.
+		c.Set(modeBoxX, modeBoxY, '┌', frame)
+		for i := 1; i < modeBoxW-1; i++ {
+			c.Set(modeBoxX+i, modeBoxY, '─', frame)
+		}
+		c.Set(modeBoxX+modeBoxW-1, modeBoxY, '╖', frame)
+		c.Set(modeBoxX, modeBoxY+1, '│', frame)
+		// Fill inner row with body bg so the previous label's chars
+		// don't ghost when the user picks a shorter option.
+		for i := 1; i < modeBoxW-1; i++ {
+			c.Set(modeBoxX+i, modeBoxY+1, ' ', bg)
+		}
+		c.Put(modeBoxX+1+labelPadL, modeBoxY+1, modeLabel, bg)
+		c.Set(modeBoxX+modeBoxW-1, modeBoxY+1, '║', frame)
+		c.Set(modeBoxX, modeBoxY+2, '╘', frame)
+		for i := 1; i < modeBoxW-1; i++ {
+			c.Set(modeBoxX+i, modeBoxY+2, '═', frame)
+		}
+		c.Set(modeBoxX+modeBoxW-1, modeBoxY+2, '╝', frame)
+		// Save the screen rect for HandleMouse hit-testing. Convert
+		// canvas-logical coords to screen coords by adding inner.X/Y
+		// and subtracting the canvas scroll.
+		p.modeRect = foxpro.Rect{
+			X: inner.X + modeBoxX - p.X,
+			Y: inner.Y + modeBoxY - p.Y,
+			W: modeBoxW,
+			H: 3,
+		}
+	}
 
-			// Indicator: ● when this button's action is currently in
-			// flight, regardless of source — UI armed press, recent
-			// UI fire, or recent CPU write that matches this button's
-			// (reg, val) pair.
-			lit := false
-			if p.pressedIdx == i && p.armed {
+	// ─── Buttons grid (below the display) ───────────────────
+	visible := p.visibleButtonDefs()
+	cols := buttonGridCols(inner.W)
+	now := time.Now()
+	for vIdx, defIdx := range visible {
+		def := buttonDefs[defIdx]
+		bxc, byc, _ := p.buttonRect(vIdx, cols)
+
+		// Indicator: ● when this button's action is currently in
+		// flight, regardless of source — UI armed press, recent UI
+		// fire, or recent CPU write that matches this button's
+		// (reg, val) pair.
+		lit := false
+		if p.pressedIdx == defIdx && p.armed {
+			lit = true
+		}
+		if p.lastFire != nil && now.Sub(p.lastFire[defIdx]) < flashDuration {
+			lit = true
+		}
+		switch def.reg {
+		case display.RegCmd:
+			if p.Controller != nil && p.Controller.LastCmd() == def.val &&
+				now.Sub(p.Controller.LastCmdAt()) < flashDuration {
 				lit = true
 			}
-			if p.lastFire != nil && now.Sub(p.lastFire[i]) < flashDuration {
+		case display.RegFrame:
+			if p.Controller != nil && now.Sub(p.Controller.LastFrameAt()) < flashDuration {
 				lit = true
 			}
-			switch def.reg {
-			case display.RegCmd:
-				if p.Controller.LastCmd() == def.val &&
-					now.Sub(p.Controller.LastCmdAt()) < flashDuration {
-					lit = true
-				}
-			case display.RegFrame:
-				if now.Sub(p.Controller.LastFrameAt()) < flashDuration {
-					lit = true
-				}
-			}
-			ind := '○'
-			if lit {
-				ind = '●'
-			}
-			// Indicator stays in the chrome blue-on-cyan style — only
-			// the glyph changes when active. Keeps the right column
-			// visually quiet; theme.Focus on the label still flags
-			// the armed state.
-			c.Set(bxc, byc, ind, chrome)
-
-			labelStyle := chrome
-			if p.pressedIdx == i && p.armed {
-				labelStyle = theme.Focus
-			}
-			c.Put(bxc+2, byc, "< "+def.label+" >", labelStyle)
 		}
-	}
-
-	// ─── Bottom: scrollable hex-dump strip drawn inside a FoxPro
-	// half-box (┌ + top rule, │ on left, scrollbar on right, └ +
-	// bottom rule with ' '@Scrollbar on the bottom-right corner).
-	// memBase is mutable (mouse wheel / '[' / ']' / '{' / '}'); rows
-	// render relative to it.
-	boxTopY := p.boxTopY()
-	memY := boxTopY + 1                  // header row
-	boxLastY := memY + memDataRows       // last data row
-	boxBotY := boxLastY + 1              // bottom rule
-	sbX := p.memScrollbarX()
-	contentLeftX := 1 // shifted right by one to clear the │ left border
-	memAsciiX := contentLeftX + memLabelW + memBytesPerRow*3 + memAsciiGap
-	base := p.curMemBase()
-
-	border := theme.Border
-	sbar := theme.Scrollbar
-	_, contentBG, _ := bg.Decompose()
-	arrow := sbar.Foreground(contentBG)
-
-	// Box chrome. Arrows live in the corners of the right column so
-	// the track between them spans every inner row — gives the thumb
-	// more travel for the same box height.
-	c.Set(0, boxTopY, '┌', border)
-	for x := 1; x < sbX; x++ {
-		c.Set(x, boxTopY, '─', border)
-	}
-	c.Set(sbX, boxTopY, '▲', arrow)
-	for y := memY; y <= boxLastY; y++ {
-		c.Set(0, y, '│', border)
-	}
-	c.Set(0, boxBotY, '└', border)
-	for x := 1; x < sbX; x++ {
-		c.Set(x, boxBotY, '─', border)
-	}
-	c.Set(sbX, boxBotY, '▼', arrow)
-
-	// Scrollbar gutter spans every content row between the arrows.
-	for y := memY; y <= boxLastY; y++ {
-		c.Set(sbX, y, ' ', sbar)
-	}
-	trackTop, trackBot := memY, boxLastY
-	trackH := trackBot - trackTop + 1
-	if trackH > 0 {
-		minBase, maxBase := p.memBounds()
-		rng := maxBase - minBase
-		thumbOff := 0
-		if rng > 0 && trackH > 1 {
-			thumbOff = ((int(base) - minBase) * (trackH - 1)) / rng
+		ind := '○'
+		if lit {
+			ind = '●'
 		}
-		thumbY := trackTop + thumbOff
-		if thumbY < trackTop {
-			thumbY = trackTop
-		}
-		if thumbY > trackBot {
-			thumbY = trackBot
-		}
-		c.Set(sbX, thumbY, '◆', arrow)
-	}
+		c.Set(bxc, byc, ind, chrome)
 
-	// Column header.
-	for col := 0; col < memBytesPerRow; col++ {
-		c.Put(contentLeftX+memLabelW+col*3, memY, fmt.Sprintf(" %02X", col), bg)
-	}
-
-	// Data rows + ASCII column.
-	for row := 0; row < memDataRows; row++ {
-		rowAddr := uint16(int(base) + row*memBytesPerRow)
-		c.Put(contentLeftX, memY+1+row, fmt.Sprintf("$%04X: ", rowAddr), bg)
-		for col := 0; col < memBytesPerRow; col++ {
-			addr := uint16(int(rowAddr) + col)
-			b := p.Bus.Read(addr)
-			c.Put(contentLeftX+memLabelW+col*3, memY+1+row, fmt.Sprintf(" %02X", b), bg)
-			ch := byte('.')
-			if b >= 0x20 && b < 0x7F {
-				ch = b
-			}
-			c.Set(memAsciiX+col, memY+1+row, rune(ch), bg)
+		labelStyle := chrome
+		if p.pressedIdx == defIdx && p.armed {
+			labelStyle = theme.Focus
 		}
+		c.Put(bxc+2, byc, "< "+centerLabel(def.label, buttonLabelW)+" >", labelStyle)
 	}
 }
 
-// boxTopY returns the canvas-y of the half-box's top rule. Sits one
-// row below the display's bottom border so the rule itself doubles as
-// the visual separator (no extra spacer needed).
-func (p *Provider) boxTopY() int { return p.Height + 2 }
+// ModeRect returns the on-screen rect of the Mode picker box from
+// the most recent Draw, in screen coords. Hosts that wire up a
+// popup via OnPickMode use this to anchor the popup just under the
+// field. Returns the zero Rect before the first Draw.
+func (p *Provider) ModeRect() foxpro.Rect { return p.modeRect }
 
-// memScrollbarX returns the canvas column hosting the vertical
-// scrollbar for the hex strip — the rightmost column of the box,
-// just past the ASCII column.
-func (p *Provider) memScrollbarX() int {
-	return 1 + memLabelW + memBytesPerRow*3 + memAsciiGap + memBytesPerRow
-}
-
-// Hex-dump layout constants — referenced from Draw and from the
-// scrollbase math/hit-testing.
-const (
-	memBytesPerRow = 16
-	memDataRows    = 7
-	memLabelW      = 7 // "$XXXX: "
-	memAsciiGap    = 2
-)
-
-// memSectionY returns the canvas-y of the header row inside the box
-// (one row below the top rule).
-func (p *Provider) memSectionY() int { return p.boxTopY() + 1 }
-
-// overMemSection reports whether (mx, my) in screen space lands on
-// the box interior (header row through last data row).
-func (p *Provider) overMemSection(mx, my int, inner foxpro.Rect) bool {
-	ly := (my - inner.Y) + p.Y
-	mY := p.memSectionY()
-	return ly >= mY && ly <= mY+memDataRows
+// runeLen counts the runes in s — distinct from len(s) which returns
+// bytes. Used for layout math against on-screen cell widths.
+func runeLen(s string) int {
+	n := 0
+	for range s {
+		n++
+	}
+	return n
 }
 
 func (p *Provider) HandleKey(ev *tcell.EventKey) bool {
@@ -538,46 +525,8 @@ func (p *Provider) HandleKey(ev *tcell.EventKey) bool {
 	case tcell.KeyHome:
 		p.SetScrollOffset(0, 0)
 		return true
-	case tcell.KeyRune:
-		// Hex-dump scroll bindings — distinct from the canvas-scroll
-		// arrow keys above so the two views move independently.
-		switch ev.Rune() {
-		case '[':
-			p.shiftMemBase(-memBytesPerRow)
-			return true
-		case ']':
-			p.shiftMemBase(memBytesPerRow)
-			return true
-		case '{':
-			p.shiftMemBase(-memSpan)
-			return true
-		case '}':
-			p.shiftMemBase(memSpan)
-			return true
-		}
 	}
 	return false
-}
-
-// HandleWheel runs before the framework's canvas-scroll fallback, so
-// the hex-dump strip gets first crack at wheel events when the cursor
-// is over it. Outside the strip, returning false lets the canvas
-// scroll take over normally.
-func (p *Provider) HandleWheel(ev *tcell.EventMouse, inner foxpro.Rect) bool {
-	mx, my := ev.Position()
-	if !p.overMemSection(mx, my, inner) {
-		return false
-	}
-	btns := ev.Buttons()
-	switch {
-	case btns&tcell.WheelUp != 0:
-		p.shiftMemBase(-memBytesPerRow)
-	case btns&tcell.WheelDown != 0:
-		p.shiftMemBase(memBytesPerRow)
-	default:
-		return false
-	}
-	return true
 }
 
 func (p *Provider) HandleMouse(ev *tcell.EventMouse, inner foxpro.Rect) bool {
@@ -588,9 +537,17 @@ func (p *Provider) HandleMouse(ev *tcell.EventMouse, inner foxpro.Rect) bool {
 		return false
 	}
 
-	// Scrollbar clicks: ▲/▼ nudge by a row, track above/below thumb
-	// pages by 7 rows.
-	if p.handleScrollbarClick(mx, my, inner) {
+	if p.modeRect.Contains(mx, my) {
+		if p.OnPickMode != nil {
+			p.OnPickMode()
+		} else if p.Controller != nil {
+			cur := p.Controller.Mode()
+			next := uint8(display.ModeChar)
+			if cur == display.ModeChar {
+				next = display.ModeGraphics
+			}
+			p.Bus.Write(p.CtrlBase+display.RegMode, next)
+		}
 		return true
 	}
 
@@ -605,84 +562,7 @@ func (p *Provider) HandleMouse(ev *tcell.EventMouse, inner foxpro.Rect) bool {
 	return false
 }
 
-// handleScrollbarClick maps a left-click in the hex-strip scrollbar
-// column to a memBase shift. Returns true when the click landed on
-// the scrollbar (consuming the event). Lands on the thumb starts a
-// drag — subsequent motion / release events are handled by
-// HandleMouseMotion / HandleMouseRelease.
-func (p *Provider) handleScrollbarClick(mx, my int, inner foxpro.Rect) bool {
-	lx := (mx - inner.X) + p.X
-	ly := (my - inner.Y) + p.Y
-	if lx != p.memScrollbarX() {
-		return false
-	}
-	boxTopY := p.boxTopY()
-	boxBotY := boxTopY + memDataRows + 2
-	if ly < boxTopY || ly > boxBotY {
-		return false
-	}
-	switch {
-	case ly == boxTopY:
-		p.shiftMemBase(-memBytesPerRow)
-	case ly == boxBotY:
-		p.shiftMemBase(memBytesPerRow)
-	default:
-		// Inside the gutter — page-jump unless click lands on the
-		// thumb, in which case start a drag.
-		trackTop, trackBot := boxTopY+1, boxBotY-1
-		trackH := trackBot - trackTop + 1
-		minBase, maxBase := p.memBounds()
-		rng := maxBase - minBase
-		thumbY := trackTop
-		if rng > 0 && trackH > 1 {
-			thumbY += ((int(p.curMemBase()) - minBase) * (trackH - 1)) / rng
-		}
-		if thumbY > trackBot {
-			thumbY = trackBot
-		}
-		switch {
-		case ly < thumbY:
-			p.shiftMemBase(-memSpan)
-		case ly > thumbY:
-			p.shiftMemBase(memSpan)
-		default:
-			p.memDragging = true
-			p.memDragTrackT = trackTop
-			p.memDragTrackB = trackBot
-		}
-	}
-	return true
-}
-
-// setMemBaseFromThumbY snaps memBase to the position implied by a
-// thumb at canvas-y `ly`, clamped to the captured track range and
-// the configured memory bounds.
-func (p *Provider) setMemBaseFromThumbY(ly int) {
-	trackH := p.memDragTrackB - p.memDragTrackT + 1
-	if trackH <= 1 {
-		return
-	}
-	rel := ly - p.memDragTrackT
-	if rel < 0 {
-		rel = 0
-	}
-	if rel > trackH-1 {
-		rel = trackH - 1
-	}
-	minBase, maxBase := p.memBounds()
-	rng := maxBase - minBase
-	newBase := minBase + (rel*rng)/(trackH-1)
-	p.memBase = uint16(newBase)
-	p.memInit = true
-}
-
 func (p *Provider) HandleMouseMotion(ev *tcell.EventMouse, inner foxpro.Rect) {
-	if p.memDragging {
-		_, my := ev.Position()
-		ly := (my - inner.Y) + p.Y
-		p.setMemBaseFromThumbY(ly)
-		return
-	}
 	if p.pressedIdx < 0 {
 		return
 	}
@@ -692,10 +572,6 @@ func (p *Provider) HandleMouseMotion(ev *tcell.EventMouse, inner foxpro.Rect) {
 }
 
 func (p *Provider) HandleMouseRelease(ev *tcell.EventMouse, inner foxpro.Rect) {
-	if p.memDragging {
-		p.memDragging = false
-		return
-	}
 	if p.armed && p.pressedIdx >= 0 {
 		p.fireButton(p.pressedIdx)
 	}
