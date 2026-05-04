@@ -9,8 +9,11 @@ GOROOT     := $(shell go env GOROOT)
 EXEC_SRC   := $(firstword $(wildcard $(GOROOT)/lib/wasm/wasm_exec.js $(GOROOT)/misc/wasm/wasm_exec.js))
 # foxpro-go ships a shared canvas-renderer + input bridge in
 # wasm/foxpro.js. Resolve its path from the module cache so we
-# always copy the version matching go.mod's pinned tag.
-FOXPRO_SRC := $(shell go list -m -f '{{.Dir}}' github.com/carledwards/foxpro-go)/wasm/foxpro.js
+# always copy the version matching go.mod's pinned tag. Deferred
+# (=) so it runs *after* `go build` has downloaded the module — on
+# a fresh CI runner with no cache, immediate (:=) evaluation
+# happens at parse time before any download and resolves to empty.
+FOXPRO_SRC = $(shell go list -m -f '{{.Dir}}' github.com/carledwards/foxpro-go)/wasm/foxpro.js
 
 build:
 	go build -o bin/6502-sim ./cmd/6502-sim
