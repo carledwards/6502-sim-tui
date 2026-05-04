@@ -7,14 +7,6 @@ EXEC_OUT   := $(WEB)/wasm_exec.js
 FOXPRO_OUT := $(WEB)/foxpro.js
 GOROOT     := $(shell go env GOROOT)
 EXEC_SRC   := $(firstword $(wildcard $(GOROOT)/lib/wasm/wasm_exec.js $(GOROOT)/misc/wasm/wasm_exec.js))
-# foxpro-go ships a shared canvas-renderer + input bridge in
-# wasm/foxpro.js. Resolve its path from the module cache so we
-# always copy the version matching go.mod's pinned tag. Deferred
-# (=) so it runs *after* `go build` has downloaded the module — on
-# a fresh CI runner with no cache, immediate (:=) evaluation
-# happens at parse time before any download and resolves to empty.
-FOXPRO_SRC = $(shell go list -m -f '{{.Dir}}' github.com/carledwards/foxpro-go)/wasm/foxpro.js
-
 build:
 	go build -o bin/6502-sim ./cmd/6502-sim
 
@@ -24,6 +16,15 @@ run: build
 # wasm — compile the browser build into web/ and copy the JS shim from
 # the active Go toolchain. Re-run after editing any Go file; `go build`
 # does its own dependency check so this is fast on no-op builds.
+#
+# foxpro.js is resolved at recipe time inside a single shell invocation:
+# `go mod download` first guarantees the module is in $(GOMODCACHE),
+# then `go list -m -f '{{.Dir}}'` returns the cache path. Computing
+# this with `:=` at parse time fails on a fresh CI runner because the
+# module isn't yet in the cache; computing with `=` (deferred) still
+# proved unreliable when `go list -m` didn't populate the graph cache
+# without an explicit `go mod download` first. So we just do both
+# steps in one shell command, fail loudly if either step missed.
 wasm:
 	@mkdir -p $(WEB)
 	GOOS=js GOARCH=wasm go build -o $(WASM_OUT) ./cmd/6502-wasm
@@ -32,11 +33,14 @@ wasm:
 	  exit 1; \
 	fi
 	@cp $(EXEC_SRC) $(EXEC_OUT)
-	@if [ ! -f "$(FOXPRO_SRC)" ]; then \
-	  echo "ERROR: foxpro.js not found at $(FOXPRO_SRC) — run 'go mod tidy' first"; \
+	@set -e; \
+	go mod download github.com/carledwards/foxpro-go; \
+	src="$$(go list -m -f '{{.Dir}}' github.com/carledwards/foxpro-go)/wasm/foxpro.js"; \
+	if [ ! -f "$$src" ]; then \
+	  echo "ERROR: foxpro.js not found at $$src"; \
 	  exit 1; \
-	fi
-	@cp $(FOXPRO_SRC) $(FOXPRO_OUT)
+	fi; \
+	cp "$$src" $(FOXPRO_OUT)
 	@ls -lh $(WASM_OUT) | awk '{print "  built " $$NF " (" $$5 ")"}'
 
 # wasm-serve — local static server on PORT (default 8765). Use after
