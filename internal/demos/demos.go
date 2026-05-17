@@ -124,7 +124,7 @@ var (
 			"Demonstrates VIA T1 free-run pacing and a",
 			"polling loop that reads the IFR.",
 		},
-		Program: buildMarquee(),
+		Program: asm.MustFromSource("marquee.s", marqueeSrc),
 	}
 	BouncerDemo = Demo{
 		Name: "&Bouncer",
@@ -133,7 +133,7 @@ var (
 			"Velocity flips on edge collisions; pacing",
 			"comes from VIA T1 underflow events.",
 		},
-		Program: buildBouncer(),
+		Program: asm.MustFromSource("bouncer.s", bouncerSrc),
 	}
 	ScrollerDemo = Demo{
 		Name: "&Scroller",
@@ -142,7 +142,7 @@ var (
 			"the VIC fine-scroll register. Same VIA pacing",
 			"as Marquee but smooth instead of stepped.",
 		},
-		Program: buildScroller(),
+		Program: asm.MustFromSource("scroller.s", scrollerSrc),
 	}
 	SnowDemo = Demo{
 		Name: "S&now (LFSR)",
@@ -151,7 +151,7 @@ var (
 			"random pixel per tick into the char plane.",
 			"Stable pattern after enough cycles.",
 		},
-		Program: buildSnow(),
+		Program: asm.MustFromSource("snow.s", snowSrc),
 	}
 	ScrollerFramedDemo = Demo{
 		Name: "Scroller (&framed)",
@@ -160,7 +160,7 @@ var (
 			"in the color plane. Shows independent layers:",
 			"foreground scrolling, background fixed.",
 		},
-		Program: buildScrollerFramed(),
+		Program: asm.MustFromSource("scroller_framed.s", scrollerFramedSrc),
 	}
 	BlitterDemo = Demo{
 		Name: "&Blitter (RAM→VIC)",
@@ -169,7 +169,7 @@ var (
 			"Demonstrates the bus throughput needed for",
 			"frame-by-frame updates.",
 		},
-		Program: buildBlitter(),
+		Program: asm.MustFromSource("blitter.s", blitterSrc),
 	}
 	QuadDemo = Demo{
 		Name: "&Quadrants (4 scrolls)",
@@ -178,7 +178,7 @@ var (
 			"quadrant of the screen. Stresses the scroll",
 			"register and the interleaved update logic.",
 		},
-		Program: buildQuad(),
+		Program: asm.MustFromSource("quad.s", quadSrc),
 	}
 	BouncingBallsDemo = Demo{
 		Name: "&Bouncing Balls (graphics mode)",
@@ -188,7 +188,7 @@ var (
 			"Hidden in the terminal build (no pixel plane).",
 		},
 		RequiresGraphics: true,
-		Program:          buildBouncingBalls(),
+		Program:          asm.MustFromSource("balls.s", ballsSrc),
 	}
 )
 
@@ -211,7 +211,7 @@ var (
 // CPU controls when to commit), third is graphics-mode programs.
 func Sections() []Section {
 	return []Section{
-		{[]Demo{MarqueeDemo, BouncerDemo, ScrollerDemo, SnowDemo}},
+		{[]Demo{HelloDemo, MarqueeDemo, BouncerDemo, ScrollerDemo, SnowDemo}},
 		{[]Demo{ScrollerFramedDemo, BlitterDemo, QuadDemo}},
 		{[]Demo{BouncingBallsDemo}},
 	}
